@@ -20,7 +20,7 @@
 // `<namespace>.backend`, `<namespace>.<backend>.model|mode`, `<namespace>.prompt`.
 //
 // The active backend is `config.get("<namespace>.backend")` →
-//   "workers-ai" | "anthropic" | "bedrock"   (default "workers-ai").
+//   "workers-ai" | "anthropic" | "bedrock" | "openrouter"   (default "workers-ai").
 //
 // NAMING — these are MODEL-ROUTE labels: each names how a model call is authed
 // and routed, NOT an agentic CLI. There is deliberately NO `opencode` /
@@ -71,6 +71,16 @@
 //     No long-lived AWS key — the run mints short-lived STS creds inside the
 //     execution and threads them into the modelGateway request.
 //
+//   backend "openrouter" (OpenRouter Chat Completions, DIRECT key — not the gateway)
+//     CONFIG_KV  pr-review.openrouter.model  `openrouter/`-prefixed model id
+//                                             e.g. openrouter/deepseek/deepseek-v4-pro
+//     CONFIG_KV  pr-review.openrouter.mode   "json" (default; tool-calling unsupported)
+//     Requires an OPENROUTER_API_KEY SECRET on the deploy (the ONLY backend with
+//     a per-backend key on the Worker — OpenRouter isn't an AI-Gateway provider,
+//     so it's called directly). The runtime strips the `openrouter/` prefix and
+//     POSTs the rest as OpenRouter's `model`. Usage accounting is on: the footer
+//     shows OpenRouter's exact `usage.cost` + reasoning tokens.
+//
 // NOTE: Workers AI model ids are bare `@cf/...` (the binding's own naming) —
 // NOT the AI-Gateway-compat `workers-ai/@cf/...` prefix the old HTTP path used.
 // Anthropic and DeepSeek model ids carry the `anthropic/` / `deepseek/` prefix;
@@ -99,7 +109,7 @@ import { BackendUnconfigured } from "./errors.js";
  * are deliberately absent (those names belong to the agent tier that spawns the
  * real binaries; specs/09-agentic-review.md).
  */
-export const BACKENDS = ["workers-ai", "anthropic", "bedrock"] as const;
+export const BACKENDS = ["workers-ai", "anthropic", "bedrock", "openrouter"] as const;
 export type Backend = (typeof BACKENDS)[number];
 
 export const DEFAULT_BACKEND: Backend = "workers-ai";
@@ -196,6 +206,15 @@ const CATALOG_MAX_TOKENS = 8_192;
 const ANTHROPIC_MAX_TOKENS = 4_096;
 const BEDROCK_MAX_TOKENS = 4_096;
 
+/**
+ * OpenRouter caps. DeepSeek v4 Pro carries a large context (like Claude) so the
+ * diff cap matches anthropic's; the token budget gets reasoning headroom (the
+ * model spends tokens thinking before the JSON answer — a tight budget truncates
+ * the answer and reads as "found nothing").
+ */
+const OPENROUTER_MAX_DIFF_CHARS = 240_000;
+const OPENROUTER_MAX_TOKENS = 8_192;
+
 /** Default region a `bedrock` backend resolves to when `regionKey` is unset. */
 const BEDROCK_DEFAULT_REGION = "us-east-1";
 
@@ -248,6 +267,17 @@ export const namespacedKeys = (
     regionKey: `${namespace}.bedrock.region`,
     defaultRegion: BEDROCK_DEFAULT_REGION,
     roleArnKey: `${namespace}.bedrock.roleArn`,
+  },
+  openrouter: {
+    modelKey: `${namespace}.openrouter.model`,
+    modeKey: `${namespace}.openrouter.mode`,
+    maxDiffCharsKey: `${namespace}.openrouter.maxDiffChars`,
+    maxTokensKey: `${namespace}.openrouter.maxTokens`,
+    defaultMaxTokens: OPENROUTER_MAX_TOKENS,
+    // Frontier reasoning models (deepseek-v4-pro) honour NO tool-calls — drive
+    // them in json/prompt mode; the engine reads the JSON answer from content.
+    defaultMode: "json",
+    defaultMaxDiffChars: OPENROUTER_MAX_DIFF_CHARS,
   },
 });
 

@@ -36,6 +36,7 @@ describe("parseBackend", () => {
     expect(parseBackend("workers-ai")).toBe("workers-ai");
     expect(parseBackend("anthropic")).toBe("anthropic");
     expect(parseBackend("bedrock")).toBe("bedrock");
+    expect(parseBackend("openrouter")).toBe("openrouter");
   });
   it("falls back to the default for unknown / unset", () => {
     expect(parseBackend(undefined)).toBe(DEFAULT_BACKEND);
@@ -173,6 +174,20 @@ describe("resolveBackend", () => {
     // Claude honours forced tool use — default to the tool-calling path.
     expect(resolved.mode).toBe("tools");
     // Frontier context window → a far larger diff cap than the catalog's.
+    expect(resolved.maxDiffChars).toBe(240_000);
+  });
+
+  it("resolves the openrouter backend (direct key, default mode = json, large diff cap)", async () => {
+    const store = {
+      "pr-review.backend": "openrouter",
+      [BACKEND_KEYS.openrouter.modelKey]: "openrouter/deepseek/deepseek-v4-pro",
+    };
+    const resolved = await Effect.runPromise(resolveBackend(getter(store)));
+    expect(resolved.backend).toBe("openrouter");
+    expect(resolved.model).toBe("openrouter/deepseek/deepseek-v4-pro");
+    // Frontier reasoning model — no tool-calling; json/prompt mode by default.
+    expect(resolved.mode).toBe("json");
+    // Large context → anthropic-sized diff cap.
     expect(resolved.maxDiffChars).toBe(240_000);
   });
 
