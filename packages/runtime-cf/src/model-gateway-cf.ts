@@ -166,6 +166,16 @@ type AiTextOutput = {
       readonly tool_calls?: ReadonlyArray<AiChatToolCall>;
     };
   }>;
+  /**
+   * Token-usage block Workers AI text-generation returns for most catalog
+   * models (top-level, alongside `response`/`choices`). Surfaced through the
+   * capability's optional `inputTokens`/`outputTokens` so a caller can meter
+   * cost; absent for models that don't report it (then the fields stay unset).
+   */
+  readonly usage?: {
+    readonly prompt_tokens?: number;
+    readonly completion_tokens?: number;
+  };
 };
 
 /**
@@ -200,6 +210,22 @@ const readToolCalls = (output: AiTextOutput): ReadonlyArray<ModelToolCall> => {
     }))
     .filter((c): c is ModelToolCall => typeof c.name === "string");
 };
+
+/**
+ * The Workers AI `usage` block mapped onto the capability's optional token
+ * fields — spread into the result so a model that doesn't report usage leaves
+ * both unset (byte-identical to the pre-usage behaviour).
+ */
+const readUsage = (
+  output: AiTextOutput,
+): { inputTokens?: number; outputTokens?: number } => ({
+  ...(typeof output.usage?.prompt_tokens === "number"
+    ? { inputTokens: output.usage.prompt_tokens }
+    : {}),
+  ...(typeof output.usage?.completion_tokens === "number"
+    ? { outputTokens: output.usage.completion_tokens }
+    : {}),
+});
 
 /** A universal-endpoint request sent through `env.AI.gateway(id).run(...)`. */
 export type AiGatewayUniversalRequest = {
@@ -387,6 +413,7 @@ const completeWorkersAi = (
     return {
       toolCalls: readToolCalls(output),
       text: readText(output),
+      ...readUsage(output),
     } satisfies ModelCompletionResult;
   });
 

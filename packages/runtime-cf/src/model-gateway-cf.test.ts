@@ -31,6 +31,7 @@ const stubAi = (
         }>;
       };
     }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
   },
 ): {
   ai: AiBinding;
@@ -187,6 +188,31 @@ describe("makeModelGatewayLive", () => {
       user: "u",
     });
     expect(result.text).toBe("");
+  });
+
+  it("surfaces the Workers AI usage block as inputTokens/outputTokens", async () => {
+    const { ai } = stubAi({
+      response: "ok",
+      usage: { prompt_tokens: 14_230, completion_tokens: 1_872 },
+    });
+    const result = await run(ai, undefined, {
+      model: "@cf/qwen/qwen2.5-coder-32b-instruct",
+      system: "s",
+      user: "u",
+    });
+    expect(result.inputTokens).toBe(14_230);
+    expect(result.outputTokens).toBe(1_872);
+  });
+
+  it("leaves token fields unset when the model reports no usage (back-compat)", async () => {
+    const { ai } = stubAi({ response: "ok" });
+    const result = await run(ai, undefined, {
+      model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      system: "s",
+      user: "u",
+    });
+    expect(result.inputTokens).toBeUndefined();
+    expect(result.outputTokens).toBeUndefined();
   });
 
   it("reads the chat-completion `choices[].message.content` when there is no top-level `response` (the glm shape)", async () => {
