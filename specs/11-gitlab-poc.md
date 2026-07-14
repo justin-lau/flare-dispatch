@@ -147,6 +147,24 @@ wrangler deploy --config $CFG
   `repo_files` (a wrong name silently drops file-content grounding — search still
   works), and the streamable-HTTP MCP transport may need an `initialize`
   handshake / `text/event-stream` accept the plain-POST client doesn't do.
+- **OpenRouter backend (frontier reasoning A/B).** A new `openrouter/` model-route
+  in `model-gateway-cf.ts` lets the review run on a frontier reasoning model
+  (DeepSeek v4 Pro) to test whether the weak grounding uplift is
+  model-intelligence-bound. UNLIKE anthropic/deepseek (BYOK via the AI Gateway),
+  OpenRouter is called DIRECTLY (`POST https://openrouter.ai/api/v1/chat/completions`,
+  `Authorization: Bearer <OPENROUTER_API_KEY>` secret) — the only backend with a
+  per-backend key on the Worker. OpenAI-compatible wire shape (reuses
+  `fromOpenAiChat`), driven in json/prompt mode (no tools; answer read from
+  `message.content`, `message.reasoning` ignored). `usage:{include:true}` opts
+  into OpenRouter usage accounting, so the cost footer shows the EXACT
+  `usage.cost` (preferred over the per-M estimate) + reasoning tokens. **To run
+  it live (no redeploy — CONFIG_KV + one secret):** `wrangler secret put
+  OPENROUTER_API_KEY`; then CONFIG_KV `pr-review.backend`=`openrouter` +
+  `pr-review.openrouter.model`=`openrouter/deepseek/deepseek-v4-pro` (mode
+  defaults to `json`). Fallback price if `usage.cost` is ever absent:
+  `pr-review.pricing.openrouter/deepseek/deepseek-v4-pro`="0.435,0.87". The
+  grounding path is backend-agnostic — context is injected into the prompt
+  regardless of which backend runs.
 
 ## Phased upstream outline
 
