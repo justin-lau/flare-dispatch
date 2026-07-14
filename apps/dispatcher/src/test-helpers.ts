@@ -231,6 +231,10 @@ export const makeFakeEnv = (opts: {
   idempotencyKv?: KVNamespace;
   configKv?: KVNamespace;
   githubWebhookSecret?: string;
+  /** GitLab webhook secret token — verifies POST /v1/webhooks/gitlab. */
+  gitlabWebhookSecret?: string;
+  /** GitLab review Workflow binding — the GitLab webhook route dispatches to it. */
+  gitlabReviewWorkflow?: Env["RUNS_WORKFLOW"];
   adminToken?: string;
   logLinkSecret?: string;
   metadata?: FakeD1;
@@ -257,6 +261,12 @@ export const makeFakeEnv = (opts: {
     ...(opts.configKv !== undefined ? { CONFIG_KV: opts.configKv } : {}),
     ...(opts.githubWebhookSecret !== undefined
       ? { GITHUB_WEBHOOK_SECRET: opts.githubWebhookSecret }
+      : {}),
+    ...(opts.gitlabWebhookSecret !== undefined
+      ? { GITLAB_WEBHOOK_SECRET: opts.gitlabWebhookSecret }
+      : {}),
+    ...(opts.gitlabReviewWorkflow !== undefined
+      ? { GITLAB_REVIEW_WORKFLOW: opts.gitlabReviewWorkflow }
       : {}),
     ...(opts.adminToken !== undefined ? { ADMIN_TOKEN: opts.adminToken } : {}),
     ...(opts.logLinkSecret !== undefined

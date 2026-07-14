@@ -1,0 +1,89 @@
+{
+  // FlareDispatch — GitLab MR-review PoC Worker.
+  //
+  // A deliberately TRIMMED copy of the root wrangler.jsonc: the free-plan deploy
+  // shape for the GitLab review PoC. Everything container / browser / email /
+  // cron / custom-domain / static-asset / Access-related is REMOVED — the PoC is
+  // a Worker-only review that reads a merge request over the GitLab API, calls a
+  // Workers AI model, and posts a note. What remains is the minimum the
+  // GitlabReviewWorkflow needs: D1 (executions rows), KV (config), the AI
+  // binding, and the review Workflow itself.
+  //
+  // Provisioning + deploy runbook: specs/11-gitlab-poc.md.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "flare-dispatch-gitlab-poc",
+  // Relative to THIS config file (apps/dispatcher/).
+  "main": "src/index.poc.ts",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": { "enabled": true },
+
+  // Workers AI binding — backs the `modelGateway` capability the review engine
+  // calls. The binding IS the auth (Workers AI is account-billed); no model API
+  // key. Optionally routed through an AI Gateway via the `AI_GATEWAY_ID` var.
+  "ai": { "binding": "AI" },
+
+  // The GitLab review Workflow (apps/dispatcher/src/workflow-gitlab.ts). Its
+  // steps map to durable checkpoints; the class is exported by src/index.poc.ts.
+  "workflows": [
+    {
+      "name": "gitlab-review",
+      "binding": "GITLAB_REVIEW_WORKFLOW",
+      "class_name": "GitlabReviewWorkflow"
+    }
+  ],
+
+  // D1 — the `executions` metadata rows the Workflow writes. Reuses the SAME
+  // migrations dir as the main deploy (infra/migrations, relative to this
+  // config). Provision a fresh DB (`wrangler d1 create flare-dispatch-gitlab-poc`)
+  // and paste its id over the placeholder below before deploying.
+  "d1_databases": [
+    {
+      "binding": "RUNS_METADATA",
+      "database_name": "flare-dispatch-gitlab-poc",
+      "database_id": "TBD-AT-DEPLOY",
+      "migrations_dir": "../../infra/migrations"
+    }
+  ],
+
+  // KV — the `config` capability. Reuses the shared `pr-review.*` keys so the
+  // operator tunes the backend/model in one place (see specs/11-gitlab-poc.md).
+  // Provision (`wrangler kv namespace create CONFIG_KV`) and paste the id.
+  "kv_namespaces": [
+    {
+      "binding": "CONFIG_KV",
+      "id": "TBD-AT-DEPLOY"
+    }
+    // IDEMPOTENCY_KV — optional receiver-level dedup on the GitLab delivery UUID
+    // (env.ts marks it `?`; the webhook route guards every use). Left commented
+    // exactly like the upstream root config: absent → dedup falls back to CF
+    // Workflows' platform-level `create({id})` no-op. Uncomment with a real id to
+    // enable it.
+    // {
+    //   "binding": "IDEMPOTENCY_KV",
+    //   "id": "TBD-AT-DEPLOY"
+    // }
+  ],
+
+  // Plain (non-secret) vars. VIEWER_ACCESS_MODE=token-only because the PoC has
+  // no Cloudflare Access application in front of it — the viewer surfaces fall
+  // back to their per-execution capability token rather than default-denying.
+  "vars": {
+    "VIEWER_ACCESS_MODE": "token-only"
+  }
+
+  // Worker Secrets (set with `wrangler secret put --config apps/dispatcher/wrangler.poc.jsonc`):
+  //   GITLAB_TOKEN           — GitLab project/group access token (scoped `api`);
+  //                            backs the live `scm` capability. See .dev.vars.example.
+  //   GITLAB_WEBHOOK_SECRET  — the secret token echoed in X-Gitlab-Token; verifies
+  //                            POST /v1/webhooks/gitlab.
+  // Out-of-band by design — not declared here.
+
+  // REMOVED vs the root config (all container/browser/host-coupled surface the
+  // PoC does not use): `assets` (dashboard SPA), `browser` binding, `routes`
+  // (custom domain), `send_email`, `containers`, `durable_objects`,
+  // `migrations` (DO-class registration — the PoC exports no DO class),
+  // `triggers.crons`, `r2_buckets`, and the ACCESS_* / PUBLIC_ORIGIN /
+  // INBOX_DOMAIN / CLOUDFLARE_ACCOUNT_ID / ADMISSION_CAP vars.
+}

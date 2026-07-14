@@ -1,0 +1,192 @@
+// FlareDispatch Dispatcher — `POST /v1/webhooks/gitlab` (GitLab PoC).
+//
+// The GitLab sibling of routes/webhook.ts, deliberately self-contained: GitLab
+// merge_request events fan out to ONE `GitlabReviewWorkflow` per (project, MR,
+// head-sha). Unlike the GitHub route it does NOT go through the run registry /
+// trigger-evaluation machinery — the PoC dispatches the single `mr-review`
+// Workflow directly.
+//
+// --- Strict opt-in (byte-parity with the GitHub route's posture) -------------
+//
+// GitLab mode is OFF by default: a deploy without `GITLAB_WEBHOOK_SECRET`
+// returns 503 rather than accepting unverified bodies.
+//
+// --- Verification ------------------------------------------------------------
+//
+// GitLab authenticates a webhook with a plain shared *secret token* echoed in
+// the `X-Gitlab-Token` header (NOT an HMAC over the body, unlike GitHub). We
+// compare it to `GITLAB_WEBHOOK_SECRET` in CONSTANT TIME (`constantTimeEqual`)
+// so a `===` early-return can't leak the secret's length/prefix via timing.
+
+import type { Env } from "../env";
+import { mrInputsFromPayload } from "@flare-dispatch/runs/mr-review";
+
+/** GitLab's webhook secret-token header. */
+const TOKEN_HEADER = "X-Gitlab-Token";
+/** GitLab's event-kind header — MR events carry exactly this value. */
+const EVENT_HEADER = "X-Gitlab-Event";
+/** GitLab's per-delivery id header (for optional dedup). */
+const EVENT_UUID_HEADER = "X-Gitlab-Event-UUID";
+/** The one event kind this route handles. */
+const MERGE_REQUEST_EVENT = "Merge Request Hook";
+/** The MR actions that warrant a (re)review. */
+const REVIEWABLE_ACTIONS = new Set(["open", "reopen", "update"]);
+/** TTL on receiver-dedup KV entries (24h) — matches the GitHub route. */
+const DEDUP_TTL_SEC = 86_400;
+
+const json = (body: unknown, status: number): Response =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+
+/**
+ * A bodyless `204 No Content` acknowledgement (GitLab redelivers on a non-2xx,
+ * so an ignored event must still ack). A 204 is a null-body status — a Response
+ * constructed with a body + 204 THROWS — so it carries no JSON.
+ */
+const noContent = (): Response => new Response(null, { status: 204 });
+
+/**
+ * Constant-time string equality. Both inputs are HMAC-SHA256'd under a fresh
+ * per-invocation random key, then the two fixed-length (32-byte) digests are
+ * XOR-accumulated — so neither the comparison time NOR the digest length leaks
+ * anything about the inputs' length or content. The double-HMAC construction is
+ * the standard defence when a native constant-time `timingSafeEqual` isn't
+ * available (workerd has no `node:crypto` `timingSafeEqual`). Exported for tests.
+ */
+export const constantTimeEqual = async (
+  a: string,
+  b: string,
+): Promise<boolean> => {
+  const keyBytes = crypto.getRandomValues(new Uint8Array(32));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const enc = new TextEncoder();
+  const [ha, hb] = await Promise.all([
+    crypto.subtle.sign("HMAC", key, enc.encode(a)),
+    crypto.subtle.sign("HMAC", key, enc.encode(b)),
+  ]);
+  const va = new Uint8Array(ha);
+  const vb = new Uint8Array(hb);
+  let diff = 0;
+  for (let i = 0; i < va.length; i++) diff |= va[i]! ^ vb[i]!;
+  return diff === 0;
+};
+
+/** The GitLab merge_request webhook payload slice this route reads. */
+type GitlabMrPayload = {
+  object_kind?: string;
+  project?: { id?: number; web_url?: string };
+  object_attributes?: {
+    iid?: number;
+    action?: string;
+    source_branch?: string;
+    target_branch?: string;
+    last_commit?: { id?: string };
+    oldrev?: string;
+    diff_refs?: { base_sha?: string; head_sha?: string };
+  };
+};
+
+/** Handle `POST /v1/webhooks/gitlab`. */
+export const handleGitlabWebhook = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  // 1. Opt-in: refuse if no webhook secret is provisioned.
+  if (env.GITLAB_WEBHOOK_SECRET === undefined) {
+    return json(
+      {
+        error: "webhook_not_configured",
+        message: "GITLAB_WEBHOOK_SECRET is unset; GitLab mode is off on this deploy",
+      },
+      503,
+    );
+  }
+
+  // 2. Constant-time verify X-Gitlab-Token against the secret.
+  const token = request.headers.get(TOKEN_HEADER) ?? "";
+  const ok = await constantTimeEqual(token, env.GITLAB_WEBHOOK_SECRET);
+  if (!ok) {
+    return json(
+      { error: "unauthorized", message: "X-Gitlab-Token missing or invalid" },
+      401,
+    );
+  }
+
+  // 3. Only merge_request events; anything else is acknowledged + ignored.
+  const event = request.headers.get(EVENT_HEADER);
+  if (event !== MERGE_REQUEST_EVENT) {
+    return noContent();
+  }
+
+  // 4. Parse the body and gate on object_kind + action.
+  let payload: GitlabMrPayload;
+  try {
+    payload = (await request.json()) as GitlabMrPayload;
+  } catch (cause) {
+    return json(
+      { error: "invalid_json", detail: cause instanceof Error ? cause.message : String(cause) },
+      400,
+    );
+  }
+  const action = payload.object_attributes?.action;
+  if (payload.object_kind !== "merge_request" || action === undefined || !REVIEWABLE_ACTIONS.has(action)) {
+    return noContent();
+  }
+
+  // 5. Optional receiver-level dedup on the delivery UUID.
+  const deliveryId = request.headers.get(EVENT_UUID_HEADER);
+  if (deliveryId !== null && deliveryId.length > 0 && env.IDEMPOTENCY_KV !== undefined) {
+    const key = `gl-delivery:${deliveryId}`;
+    const seen = await env.IDEMPOTENCY_KV.get(key);
+    if (seen !== null) {
+      return json({ deduped: true, deliveryId }, 202);
+    }
+    await env.IDEMPOTENCY_KV.put(key, "1", { expirationTtl: DEDUP_TTL_SEC });
+  }
+
+  // 6. The review Workflow must be bound to dispatch.
+  if (env.GITLAB_REVIEW_WORKFLOW === undefined) {
+    return json(
+      {
+        error: "workflow_not_configured",
+        message: "GITLAB_REVIEW_WORKFLOW binding is absent on this deploy",
+      },
+      503,
+    );
+  }
+
+  // 7. Extract the run inputs (mrInputsFromPayload is the run's canonical
+  //    mapping — prefers diff_refs endpoints). Add source/target branch context.
+  const input = {
+    ...mrInputsFromPayload(payload),
+    ...(payload.object_attributes?.source_branch !== undefined
+      ? { sourceBranch: payload.object_attributes.source_branch }
+      : {}),
+    ...(payload.object_attributes?.target_branch !== undefined
+      ? { targetBranch: payload.object_attributes.target_branch }
+      : {}),
+  };
+
+  // 8. Dispatch — a stable id collapses redeliveries at the platform layer.
+  const id = `mr-review:${input.projectId}:${input.iid}:${input.headSha.slice(0, 12)}`;
+  try {
+    await env.GITLAB_REVIEW_WORKFLOW.create({ id, params: { executionId: id, input } });
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    // A duplicate create IS the dedup path — treat it as accepted.
+    if (!/already.?exists|duplicate/i.test(message)) {
+      console.error(`[webhook-gitlab] create failed id="${id}": ${message}`);
+      return json({ error: "dispatch_failed", detail: message }, 500);
+    }
+  }
+
+  return json({ accepted: true, executionId: id, action }, 202);
+};

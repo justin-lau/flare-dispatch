@@ -1,0 +1,16 @@
+# FlareDispatch GitLab PoC — local Worker secrets (`.dev.vars`).
+#
+# Copy to `.dev.vars` next to wrangler.poc.jsonc and fill in. `wrangler dev
+# --config apps/dispatcher/wrangler.poc.jsonc` loads these as Worker secrets;
+# on a real deploy set them with `wrangler secret put <NAME> --config
+# apps/dispatcher/wrangler.poc.jsonc`. See specs/11-gitlab-poc.md.
+
+# GitLab project/group access token, scoped `api`. Backs the live `scm`
+# capability: reads the MR diff and posts the review note. Absent → the review
+# degrades (fetchDiff fails, postReview no-ops).
+GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
+
+# The webhook secret token. Set the SAME value in the GitLab project webhook's
+# "Secret token" field; the webhook route constant-time-compares the inbound
+# X-Gitlab-Token header against it. Absent → POST /v1/webhooks/gitlab returns 503.
+GITLAB_WEBHOOK_SECRET=a-long-random-secret

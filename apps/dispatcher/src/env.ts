@@ -155,6 +155,32 @@ export interface Env {
   readonly GITHUB_WEBHOOK_SECRET?: string;
 
   /**
+   * GitLab project/group access token (scoped `api`) — Worker secret, set via
+   * `wrangler secret put GITLAB_TOKEN`. Backs the live GitLab `scm` capability
+   * (`makeGitlabScmLive`): reads a merge request's diff and posts the review
+   * note. Absent → the degraded `Scm` Layer (fetchDiff fails `auth-failed`,
+   * postReview is a logged no-op). Only the `mr-review` PoC touches it.
+   * See specs/11-gitlab-poc.md.
+   */
+  readonly GITLAB_TOKEN?: string;
+
+  /**
+   * GitLab webhook secret token — Worker secret. Verifies the `X-Gitlab-Token`
+   * header on `POST /v1/webhooks/gitlab` (a constant-time compare). Absent → the
+   * GitLab webhook route refuses (`503 webhook_not_configured`): like the GitHub
+   * webhook, GitLab mode is opt-in and never accepts unverified deliveries.
+   */
+  readonly GITLAB_WEBHOOK_SECRET?: string;
+
+  /**
+   * The GitLab MR-review Workflow binding — instantiates `GitlabReviewWorkflow`
+   * executions from the GitLab webhook route. Present only on the GitLab PoC
+   * deploy (apps/dispatcher/wrangler.poc.jsonc). Absent → the webhook route
+   * `503`s (the binding is required to dispatch a review).
+   */
+  readonly GITLAB_REVIEW_WORKFLOW?: Workflow;
+
+  /**
    * Admin bearer token — Worker secret. Gates `POST /v1/admin/events/:wf_id`
    * (the `step.waitForEvent` signalling surface, specs/03-dsl.md
    * § Human-in-the-loop). Production deploys put Cloudflare Access in front

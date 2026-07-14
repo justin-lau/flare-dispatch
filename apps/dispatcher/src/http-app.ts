@@ -55,6 +55,7 @@ import { handleOidcDiscovery, handleOidcJwks } from "./routes/oidc";
 import { handleProductDemo } from "./routes/product-demos";
 import { handleReplay } from "./routes/replay";
 import { handleGithubWebhook } from "./routes/webhook";
+import { handleGitlabWebhook } from "./routes/webhook-gitlab";
 import { handleSignalsWebhook } from "./routes/signals-webhook";
 
 /** `owner/repo` slug for the dashboard source link. */
@@ -471,6 +472,10 @@ const router = baseRouter.pipe(
   HttpRouter.all(
     "/v1/webhooks/github",
     route("POST", ({ request, env }) => handleGithubWebhook(request, env)),
+  ),
+  HttpRouter.all(
+    "/v1/webhooks/gitlab",
+    route("POST", ({ request, env }) => handleGitlabWebhook(request, env)),
   ),
   HttpRouter.all(
     "/v1/webhooks/signals/:source",
