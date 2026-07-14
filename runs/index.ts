@@ -18,6 +18,7 @@ export { playwrightE2E } from "./playwright-e2e";
 export { productDemo } from "./product-demo";
 export { playwrightDemo } from "./playwright-demo";
 export { prReview } from "./pr-review";
+export { mrReview } from "./mr-review";
 export { specDriftPr } from "./spec-drift-pr";
 export { ciTriagePr } from "./ci-triage-pr";
 export { refreshFixtures } from "./refresh-fixtures";
