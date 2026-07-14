@@ -158,12 +158,83 @@ const submitReviewTool: ModelTool = {
   parameters: toolParameters(SubmitReviewSchema as unknown as Schema.Schema<unknown, unknown>),
 };
 
-/** The agentic reviewer's base system instruction (before operator guidelines). */
-const AGENTIC_REVIEW_SYSTEM_PROMPT = `You are a senior code reviewer performing an AGENTIC review of a single merge-request diff.
+// --- Retrieval profiles -----------------------------------------------------
+//
+// Two substrates for the SAME agentic loop — a control experiment isolating
+// whether the agentic win is agency (substrate-agnostic) or hakiri specifically:
+//
+//   "hakiri"  (default) — hakiri_search (semantic) + hakiri_query (SQL over the
+//                          `repo_files` table). Current behavior, byte-identical.
+//   "repo-fs"           — search_code (ripgrep-style) + read_file (raw path read),
+//                          pointed at a bridge speaking the SAME /mcp tools/call
+//                          contract with different tool names.
+//
+// Only the tool SET + its prompt blurb change; MAX_TURNS, the per-turn cap, 12k
+// truncation, cost accumulation, the state-size guard, and the step-per-turn
+// driver are reused unchanged for both.
+
+/** The retrieval substrate — a plain (non-secret) string carried in the state. */
+export const RETRIEVAL_PROFILES = ["hakiri", "repo-fs"] as const;
+export type RetrievalProfile = (typeof RETRIEVAL_PROFILES)[number];
+const DEFAULT_PROFILE: RetrievalProfile = "hakiri";
+
+/** Narrow a CONFIG_KV value to a known profile, or the default. */
+const parseProfile = (raw: string | undefined): RetrievalProfile =>
+  RETRIEVAL_PROFILES.includes(raw as RetrievalProfile) ? (raw as RetrievalProfile) : DEFAULT_PROFILE;
+
+const searchCodeTool: ModelTool = {
+  name: "search_code",
+  description:
+    "Regex / full-text search across the repository's main-branch files. Returns matching path:line:excerpt. Optionally scope with a path glob to a subset of files.",
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "a ripgrep regex / search pattern" },
+      glob: { type: "string", description: 'optional path glob to scope the search, e.g. "*.ts"' },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  },
+};
+
+const readFileTool: ModelTool = {
+  name: "read_file",
+  description:
+    "Read a whole file from the repository by path relative to the repo root (no .. or absolute paths).",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "a path relative to the repo root" },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
+};
+
+/** The retrieval tools offered for a profile (submit_review is appended separately). */
+const retrievalToolsFor = (profile: RetrievalProfile): ReadonlyArray<ModelTool> =>
+  profile === "repo-fs" ? [searchCodeTool, readFileTool] : [hakiriSearchTool, hakiriQueryTool];
+
+/** Every retrieval tool name the executor knows — a call to any other is an error. */
+const KNOWN_RETRIEVAL_TOOLS = new Set(["hakiri_search", "hakiri_query", "search_code", "read_file"]);
+
+/** The per-profile tool blurb for the system prompt — parameterized so the prompt
+ *  never hardcodes one profile's tool names. */
+const retrievalToolBlurb = (profile: RetrievalProfile): string =>
+  profile === "repo-fs"
+    ? `  - search_code(query, glob?): regex / full-text search across the repository's main-branch files; returns matching path:line:excerpt. Optionally scope with a path glob (e.g. "*.ts").
+  - read_file(path): read a whole file by path relative to the repo root (no .. or absolute paths).`
+    : `  - hakiri_search(query): full-text search for relevant code (call sites, helpers, types).
+  - hakiri_query(sql): read whole files via SQL over the \`repo_files\` table (columns path/name/ext/size/content/deleted — ALWAYS filter \`not deleted\`).`;
+
+/** The agentic reviewer's base system instruction (before operator guidelines),
+ *  parameterized by retrieval profile. The hakiri profile reproduces the original
+ *  prompt byte-for-byte (the default path is unchanged). */
+const agenticSystemPrompt = (profile: RetrievalProfile): string =>
+  `You are a senior code reviewer performing an AGENTIC review of a single merge-request diff.
 
 You may call retrieval tools to inspect the surrounding code on the repository's main branch BEFORE deciding:
-  - hakiri_search(query): full-text search for relevant code (call sites, helpers, types).
-  - hakiri_query(sql): read whole files via SQL over the \`repo_files\` table (columns path/name/ext/size/content/deleted — ALWAYS filter \`not deleted\`).
+${retrievalToolBlurb(profile)}
 
 Investigate only what you need — a few targeted calls, not exhaustive crawling. When you have enough context, call submit_review exactly once with your findings (an empty array is valid when the change is clean). Anchor every finding to a real file path and line range present in the diff. Prefer a small number of high-signal findings. Do not respond with prose — a tool call is your output.`;
 
@@ -204,6 +275,8 @@ export type AgenticState = {
   readonly model: string;
   /** Resolved backend name (informational). */
   readonly backend: string;
+  /** The retrieval substrate — selects which tool set the turn offers. Non-secret. */
+  readonly profile: RetrievalProfile;
   /** Per-turn output-token budget. */
   readonly maxTokens: number;
   /** The risk tier (pure heuristic on the diff) — stitched onto the output. */
@@ -246,9 +319,10 @@ export const initAgenticReview = (
     );
     const tier = yield* riskTier({ diff });
 
+    const profile = parseProfile(yield* config.get("pr-review.retrieval.profile"));
     const guidelines = (yield* config.get(guidelinesKey(NS)))?.trim();
     const systemPrompt = composeSystemPrompt({
-      base: AGENTIC_REVIEW_SYSTEM_PROMPT,
+      base: agenticSystemPrompt(profile),
       ...(guidelines !== undefined && guidelines !== "" ? { guidelines } : {}),
     });
     const userBody = renderDomainBody({
@@ -275,6 +349,7 @@ export const initAgenticReview = (
       done: false,
       model: resolved.model,
       backend: resolved.backend,
+      profile,
       maxTokens: resolved.maxTokens,
       tier,
       ...(retrieval !== undefined ? { retrieval } : {}),
@@ -292,6 +367,7 @@ const errorState = (message: string): AgenticState => ({
   error: { rateLimited: false, message },
   model: "",
   backend: "",
+  profile: DEFAULT_PROFILE,
   maxTokens: 0,
   tier: "trivial",
   toolCallCount: 0,
@@ -367,7 +443,7 @@ export const runAgenticTurn = (
     const tools =
       isFinalTurn || !hasRetrieval
         ? [submitReviewTool]
-        : [hakiriSearchTool, hakiriQueryTool, submitReviewTool];
+        : [...retrievalToolsFor(state.profile), submitReviewTool];
 
     // (ii) Call the model — `messages` takes precedence over system/user.
     const result = yield* modelGateway
@@ -454,7 +530,7 @@ const executePendingToolCalls = (
       if (tc.name === "submit_review") continue;
 
       let content: string;
-      if (tc.name !== "hakiri_search" && tc.name !== "hakiri_query") {
+      if (!KNOWN_RETRIEVAL_TOOLS.has(tc.name)) {
         content = `error: unknown tool "${tc.name}"`;
       } else if (call === undefined) {
         content = "error: no retrieval endpoint is configured; proceed with the diff alone";
@@ -505,23 +581,64 @@ export const isReadOnlyRepoQuery = (sql: string): boolean => {
 const SQL_REJECTED =
   "query rejected: only read-only SELECT/WITH over repo_files is allowed (no file/network functions)";
 
-/** Execute ONE retrieval call — never throws (any failure → an error string). */
+/**
+ * The repo-fs `read_file` path allowlist (defense-in-depth; the bridge also
+ * confines). Rejects an absolute path, one starting with "/", or any `..` segment
+ * — so a model steered by untrusted content can't read outside the repo. Pure +
+ * exported for unit testing.
+ */
+export const isSafeRepoPath = (path: string): boolean => {
+  const p = path.trim();
+  if (p === "") return false;
+  if (p.startsWith("/")) return false; // posix absolute / leading slash
+  if (/^[A-Za-z]:[\\/]/.test(p)) return false; // windows drive-absolute (defensive)
+  // No `..` segment anywhere (split on both separators).
+  return !p.split(/[\\/]/).some((seg) => seg === "..");
+};
+
+/** The tool result returned (WITHOUT calling the bridge) for a rejected path. */
+const PATH_REJECTED =
+  "path rejected: must be a relative path inside the repo (no .. or absolute paths)";
+
+/** Execute ONE retrieval call — never throws (any failure → an error string).
+ *  Dispatches on the tool name across BOTH profiles (only one profile's tools are
+ *  ever offered, but the executor tolerates either). */
 const runOneRetrieval = async (
   call: (name: string, argument: Record<string, unknown>) => Promise<unknown>,
   tc: ModelToolCall,
 ): Promise<string> => {
   try {
     const args = readArgs(tc.arguments);
-    if (tc.name === "hakiri_search") {
-      const query = String(args.query ?? "");
-      return toolText(await call("context.search", { query, limit: SEARCH_LIMIT })) || "(no results)";
+    switch (tc.name) {
+      case "hakiri_search": {
+        const query = String(args.query ?? "");
+        return toolText(await call("context.search", { query, limit: SEARCH_LIMIT })) || "(no results)";
+      }
+      case "hakiri_query": {
+        const sql = String(args.sql ?? "");
+        // Client-side allowlist BEFORE the bridge sees the SQL.
+        if (!isReadOnlyRepoQuery(sql)) return SQL_REJECTED;
+        return toolText(await call("context.query", { sql })) || "(no rows)";
+      }
+      case "search_code": {
+        const query = String(args.query ?? "");
+        const glob = args.glob !== undefined ? String(args.glob) : undefined;
+        return (
+          toolText(await call("search_code", { query, ...(glob !== undefined ? { glob } : {}) })) ||
+          "(no matches)"
+        );
+      }
+      case "read_file": {
+        const path = String(args.path ?? "");
+        // Client-side path guard BEFORE the bridge sees the path.
+        if (!isSafeRepoPath(path)) return PATH_REJECTED;
+        return toolText(await call("read_file", { path })) || "(empty file)";
+      }
+      default:
+        return `error: unknown tool "${tc.name}"`;
     }
-    const sql = String(args.sql ?? "");
-    // Client-side allowlist BEFORE the bridge sees the SQL.
-    if (!isReadOnlyRepoQuery(sql)) return SQL_REJECTED;
-    return toolText(await call("context.query", { sql })) || "(no rows)";
   } catch (e) {
-    return `error: hakiri call failed — ${e instanceof Error ? e.message : String(e)}`;
+    return `error: retrieval call failed — ${e instanceof Error ? e.message : String(e)}`;
   }
 };
 
@@ -568,7 +685,7 @@ export const finalizeAgentic = (
   const output = { ...coordinateReview({ findings: state.findings }), tier: state.tier };
   const cost = costFooter({ model: state.model, usage: state.cost, pricing: state.pricing });
   const retrievalNote = state.retrieval === undefined ? " · no retrieval endpoint" : "";
-  const metaLine = `🔁 agentic · ${state.turn} turn(s) · ${state.toolCallCount} retrieval call(s)${retrievalNote}`;
+  const metaLine = `🔁 agentic (${state.profile}) · ${state.turn} turn(s) · ${state.toolCallCount} retrieval call(s)${retrievalNote}`;
   const footer = cost !== null ? `${cost}\n${metaLine}` : metaLine;
 
   return {

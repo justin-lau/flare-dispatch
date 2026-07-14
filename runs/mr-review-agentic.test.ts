@@ -20,6 +20,7 @@ import {
   finalizeAgentic,
   initAgenticReview,
   isReadOnlyRepoQuery,
+  isSafeRepoPath,
   MAX_TURNS,
   runAgenticReview,
   runAgenticTurn,
@@ -65,6 +66,7 @@ const baseState = (o: Partial<AgenticState> = {}): AgenticState => ({
   done: false,
   model: "openrouter/x",
   backend: "openrouter",
+  profile: "hakiri",
   maxTokens: 4096,
   tier: "lite",
   retrieval: { endpoint: ENDPOINT },
@@ -179,6 +181,36 @@ describe("initAgenticReview", () => {
     );
     expect(state.retrieval).toBeUndefined();
     expect(state.done).toBe(false);
+  });
+
+  it("defaults the retrieval profile to hakiri and builds the hakiri tool prompt when the key is unset", async () => {
+    const config = makeConfigFake({
+      "pr-review.backend": "openrouter",
+      "pr-review.openrouter.model": "openrouter/m",
+    });
+    const scm = makeScmFake({ diff: SAMPLE_DIFF });
+    const state = await Effect.runPromise(
+      initAgenticReview(INPUT).pipe(Effect.provide(Layer.mergeAll(config, scm.layer))),
+    );
+    expect(state.profile).toBe("hakiri");
+    expect(state.messages[0]?.content).toContain("hakiri_search");
+    expect(state.messages[0]?.content).not.toContain("search_code");
+  });
+
+  it("reads profile=repo-fs and builds the repo-fs tool prompt (search_code / read_file)", async () => {
+    const config = makeConfigFake({
+      "pr-review.backend": "openrouter",
+      "pr-review.openrouter.model": "openrouter/m",
+      "pr-review.retrieval.profile": "repo-fs",
+    });
+    const scm = makeScmFake({ diff: SAMPLE_DIFF });
+    const state = await Effect.runPromise(
+      initAgenticReview(INPUT).pipe(Effect.provide(Layer.mergeAll(config, scm.layer))),
+    );
+    expect(state.profile).toBe("repo-fs");
+    expect(state.messages[0]?.content).toContain("search_code");
+    expect(state.messages[0]?.content).toContain("read_file");
+    expect(state.messages[0]?.content).not.toContain("hakiri_query");
   });
 
   it("clamps the agentic diff below the backend cap (Workflow step-return budget)", async () => {
@@ -576,5 +608,127 @@ describe("isReadOnlyRepoQuery (hakiri_query SQL allowlist)", () => {
     expect(
       isReadOnlyRepoQuery("select copy_count from repo_files where content like '%loaded%' and not deleted"),
     ).toBe(true);
+  });
+});
+
+describe("repo-fs retrieval profile", () => {
+  it("offers [search_code, read_file, submit_review] on a normal turn", async () => {
+    const fake = makeModelGatewayFake({ responses: [submitCall([])] });
+    await runTurn(baseState({ profile: "repo-fs" }), fake);
+    const req = (fake.state as ModelGatewayFakeState).requests[0];
+    expect(req?.tools?.map((t) => t.name)).toEqual(["search_code", "read_file", "submit_review"]);
+  });
+
+  it("a search_code call POSTs tools/call name=search_code (with the glob) to the bridge", async () => {
+    const seen: { name?: string; args?: unknown } = {};
+    server.use(
+      http.post(`${ENDPOINT}/mcp`, async ({ request }) => {
+        const body = (await request.json()) as { params: { name: string; arguments: unknown } };
+        seen.name = body.params.name;
+        seen.args = body.params.arguments;
+        return envelope({ columns: ["match"], rows: [["src/foo.ts:1: hit"]] });
+      }),
+    );
+    const state = baseState({
+      profile: "repo-fs",
+      turn: 1,
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: "u" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "s0", name: "search_code", arguments: { query: "helper", glob: "*.ts" } }],
+        },
+      ],
+    });
+    const fake = makeModelGatewayFake({ responses: [submitCall([])] });
+    await runTurn(state, fake);
+    expect(seen.name).toBe("search_code");
+    expect(seen.args).toEqual({ query: "helper", glob: "*.ts" });
+  });
+
+  it("a read_file call POSTs tools/call name=read_file to the bridge", async () => {
+    const seen: { name?: string; args?: unknown } = {};
+    server.use(
+      http.post(`${ENDPOINT}/mcp`, async ({ request }) => {
+        const body = (await request.json()) as { params: { name: string; arguments: unknown } };
+        seen.name = body.params.name;
+        seen.args = body.params.arguments;
+        return envelope({ columns: ["content"], rows: [["export const x = 1;"]] });
+      }),
+    );
+    const state = baseState({
+      profile: "repo-fs",
+      turn: 1,
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: "u" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "f0", name: "read_file", arguments: { path: "src/foo.ts" } }],
+        },
+      ],
+    });
+    const fake = makeModelGatewayFake({ responses: [submitCall([])] });
+    await runTurn(state, fake);
+    expect(seen.name).toBe("read_file");
+    expect(seen.args).toEqual({ path: "src/foo.ts" });
+  });
+
+  it("read_file path guard rejects traversal / absolute paths WITHOUT hitting the bridge", async () => {
+    let bridgeCalled = false;
+    server.use(
+      http.post(`${ENDPOINT}/mcp`, () => {
+        bridgeCalled = true;
+        return envelope({ columns: [], rows: [] });
+      }),
+    );
+    const badPaths = ["../etc/passwd", "/etc/passwd", "a/../../x"];
+    const state = baseState({
+      profile: "repo-fs",
+      turn: 1,
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: "u" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: badPaths.map((p, i) => ({ id: `r${i}`, name: "read_file", arguments: { path: p } })),
+        },
+      ],
+    });
+    const fake = makeModelGatewayFake({ responses: [submitCall([])] });
+    await runTurn(state, fake);
+    const toolMsgs =
+      (fake.state as ModelGatewayFakeState).requests[0]?.messages?.filter((m) => m.role === "tool") ??
+      [];
+    expect(toolMsgs).toHaveLength(3);
+    for (const m of toolMsgs) expect(m.content).toContain("path rejected");
+    expect(bridgeCalled).toBe(false);
+  });
+});
+
+describe("isSafeRepoPath (repo-fs read_file guard)", () => {
+  it("accepts a relative repo path", () => {
+    expect(isSafeRepoPath("src/foo.ts")).toBe(true);
+    expect(isSafeRepoPath("a/b/c.md")).toBe(true);
+  });
+  it("rejects absolute / leading-slash / drive paths", () => {
+    expect(isSafeRepoPath("/etc/passwd")).toBe(false);
+    expect(isSafeRepoPath("C:\\Windows\\x")).toBe(false);
+  });
+  it("rejects any .. traversal segment", () => {
+    expect(isSafeRepoPath("../etc/passwd")).toBe(false);
+    expect(isSafeRepoPath("a/../../x")).toBe(false);
+    expect(isSafeRepoPath("a/../b")).toBe(false);
+  });
+  it("rejects empty / whitespace", () => {
+    expect(isSafeRepoPath("")).toBe(false);
+    expect(isSafeRepoPath("   ")).toBe(false);
+  });
+  it("does not false-reject a filename that merely contains '..' without being a whole segment", () => {
+    expect(isSafeRepoPath("src/foo..bar.ts")).toBe(true);
   });
 });
