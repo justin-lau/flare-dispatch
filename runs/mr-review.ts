@@ -47,15 +47,19 @@ import {
   coordinate as engineCoordinate,
   DEFAULT_NAMESPACE,
   DEFAULT_REVIEW_SYSTEM_PROMPT,
+  encodeFindingPath,
   type Finding,
+  findingLoc,
   guidelinesKey,
   ModelCallFailed,
   resolveBackend,
   ReviewOutputSchema,
   reviewDomain,
   riskTier,
+  sanitizeModelText,
   stripDiffNoise,
   StructuredOutputInvalid,
+  tableCell,
   type Tier,
 } from "@flare-dispatch/review-agent";
 
@@ -119,30 +123,76 @@ const planForTier = (tier: Tier): Plan =>
 const planForMode = (mode: AgentMode, tier: Tier): Plan =>
   mode === "single" ? { tier, agents: GENERAL_AGENT } : planForTier(tier);
 
+type ReviewOutput = typeof ReviewOutputSchema.Type;
+
 /**
- * The MR review program — a flat Effect over `Config | ModelGateway | Scm`.
- * Exported so the PoC Workflow runs it directly with a minimal Layer stack
- * (no container / step machinery). Always posts a note — success OR failure —
- * then returns the review output (or re-fails as `StepFailed` on any error).
+ * The result of {@link mrReviewCompute}: the review output (`null` when the
+ * review could not complete) and the FULLY RENDERED note body to post — success
+ * or failure. Carrying the body (rather than posting inline) lets the caller
+ * post it as a SEPARATE durable step (see {@link mrPostNote}).
+ */
+export type MrComputeResult = {
+  readonly output: ReviewOutput | null;
+  readonly noteBody: string;
+};
+
+/** Render the "could not complete" failure note — the reason is model-influenced
+ *  (it can carry provider/model error text), so it is sanitized before it lands
+ *  in the public note. */
+const failureNote = (reason: string): string =>
+  [`⚠️ **mr-review could not complete**: ${sanitizeModelText(reason)}`, "", COMMENT_MARKER].join(
+    "\n",
+  );
+
+/**
+ * The review COMPUTE — resolve backend, fetch the diff, fan out reviewers,
+ * coordinate, and RENDER the note — but do NOT post. Never fails: any error is
+ * caught and rendered into a "could not complete" note body with `output: null`.
+ * A flat Effect over `Config | ModelGateway | Scm`.
+ *
+ * Posting is the caller's separate concern (a distinct Workflow step) so a
+ * mid-flight replay re-runs neither the model fan-out NOR the note post twice.
+ */
+export const mrReviewCompute = (
+  input: MrReviewInput,
+): Effect.Effect<MrComputeResult, never, Config | ModelGateway | Scm> =>
+  reviewBody(input).pipe(
+    Effect.map(
+      (output): MrComputeResult => ({ output, noteBody: renderReviewComment(input, output) }),
+    ),
+    Effect.catchAll((err) =>
+      Effect.succeed<MrComputeResult>({ output: null, noteBody: failureNote(describeError(err)) }),
+    ),
+  );
+
+/** Post a review note for a change. Exported so the PoC Workflow posts it as its
+ *  OWN durable step (idempotent — a replay after a completed post never re-posts). */
+export const mrPostNote = (input: MrReviewInput, body: string) =>
+  scm.postReview({ ref: refFor(input), body });
+
+/**
+ * The standalone run program — a flat Effect over `Config | ModelGateway | Scm`
+ * (used by the `defineRun` value). Computes, posts the note best-effort, then
+ * returns the output on success or re-fails as `StepFailed` on a failure verdict
+ * so a red review is honest. (The PoC Workflow instead calls `mrReviewCompute` +
+ * `mrPostNote` as two steps — see workflow-gitlab.ts.)
  */
 export const mrReviewProgram = (
   input: MrReviewInput,
-): Effect.Effect<typeof ReviewOutputSchema.Type, StepFailed, Config | ModelGateway | Scm> =>
-  reviewBody(input).pipe(
-    Effect.catchAll((err) =>
-      Effect.gen(function* () {
-        const reason = describeError(err);
-        // Best-effort failure note — a post failure must not mask the cause.
-        yield* postNote(
-          input,
-          [`⚠️ **mr-review could not complete**: ${reason}`, "", COMMENT_MARKER].join("\n"),
-        ).pipe(
-          Effect.catchAll((postErr) =>
-            Effect.logWarning(`mr-review: failure-note post failed — ${describeError(postErr)}`),
-          ),
-        );
-        return yield* Effect.fail(new StepFailed({ step: "mr-review", cause: reason }));
-      }),
+): Effect.Effect<ReviewOutput, StepFailed, Config | ModelGateway | Scm> =>
+  mrReviewCompute(input).pipe(
+    Effect.flatMap((r) =>
+      mrPostNote(input, r.noteBody).pipe(
+        // Best-effort — a post failure must not mask the review's verdict.
+        Effect.catchAll((e) =>
+          Effect.logWarning(`mr-review: posting MR note failed — ${describeError(e)}`),
+        ),
+        Effect.flatMap(() =>
+          r.output !== null
+            ? Effect.succeed(r.output)
+            : Effect.fail(new StepFailed({ step: "mr-review", cause: "review could not complete" })),
+        ),
+      ),
     ),
   );
 
@@ -195,19 +245,10 @@ const reviewBody = (input: MrReviewInput) =>
       Either.isRight(r) ? r.right : [],
     );
 
-    // 7. Coordinate — pure deterministic dedup + counts + verdict.
+    // 7. Coordinate — pure deterministic dedup + counts + verdict. Rendering +
+    //    posting the note is the caller's concern (mrReviewCompute → mrPostNote).
     const coordinated = yield* engineCoordinate({ findings });
-    const output = { ...coordinated, tier: plan.tier };
-
-    // 8. Post the visible MR note. Best-effort — a note failure must not turn a
-    //    green review red.
-    yield* postNote(input, renderReviewComment(input, output)).pipe(
-      Effect.catchAll((e) =>
-        Effect.logWarning(`mr-review: posting MR note failed — ${describeError(e)}`),
-      ),
-    );
-
-    return output;
+    return { ...coordinated, tier: plan.tier };
   });
 
 // ---------------------------------------------------------------------------
@@ -219,9 +260,6 @@ const refFor = (input: MrReviewInput): ChangeRef => ({
   headSha: input.headSha,
   baseSha: input.baseSha,
 });
-
-const postNote = (input: MrReviewInput, body: string) =>
-  scm.postReview({ ref: refFor(input), body });
 
 /** Compose the reviewer system prompt — base + optional operator guidelines. */
 const composeSystemPromptLocal = (base: string, guidelines: string | undefined): string => {
@@ -249,46 +287,27 @@ const describeError = (err: unknown): string => {
 };
 
 // --- Comment rendering (GitLab flavour) -------------------------------------
-
-const SANITIZE_MAX = 500;
-// U+200B zero-width space — inserted after `@` breaks GitLab's @mention autolink
-// without visibly altering the text (mirrors pr-review's defence).
-const ZWSP = String.fromCharCode(0x200b);
-/** Neutralize model-authored text before it renders in the public MR note. */
-const sanitizeModelText = (s: string): string =>
-  s
-    .replace(/[\r\n]+/g, " ")
-    .replace(/[<>]/g, "")
-    .replace(/`/g, "'")
-    .replace(/@(?=[\w-])/g, `@${ZWSP}`)
-    .slice(0, SANITIZE_MAX);
+//
+// The provider-agnostic sanitizers (sanitizeModelText / encodeFindingPath /
+// findingLoc / tableCell) come from @flare-dispatch/review-agent — ONE audited
+// copy shared with the GitHub path (pr-review keeps its byte-identical private
+// copies for now; see specs/11-gitlab-poc.md). Only the GitLab-specific blob-URL
+// shape lives here.
 
 /**
  * GitLab blob URL for a finding — `<web_url>/-/blob/<sha>/<path>#L<n>`. `web_url`
- * + `sha` come from the trusted webhook input; `path` is model-authored, so each
- * segment is sanitized then URL-encoded. The line fragment is dropped when the
- * model's line numbers are nonsense (≤ 0), leaving a plain file link.
+ * + `sha` come from the trusted webhook input; `path` is model-authored, so it is
+ * sanitized + URL-encoded by the shared `encodeFindingPath`. The line fragment is
+ * dropped when the model's line numbers are nonsense (≤ 0), leaving a plain file
+ * link. NB the GitLab fragment is `#L<start>-<end>` (GitHub uses `-L<end>`).
  */
 const findingUrl = (webUrl: string, sha: string, f: Finding): string => {
-  const encodedPath = sanitizeModelText(f.path)
-    .replace(/^\/+/, "")
-    .split("/")
-    .map(encodeURIComponent)
-    .join("/")
-    .replace(/\(/g, "%28")
-    .replace(/\)/g, "%29");
+  const encodedPath = encodeFindingPath(f.path);
   const start = Math.floor(f.startLine);
   const end = Math.floor(f.endLine);
   const fragment = start > 0 ? (end > start ? `#L${start}-${end}` : `#L${start}`) : "";
   return `${webUrl.replace(/\/$/, "")}/-/blob/${sha}/${encodedPath}${fragment}`;
 };
-
-const findingLoc = (f: Finding): string => {
-  const path = sanitizeModelText(f.path).replace(/[[\]]/g, "");
-  return f.startLine === f.endLine ? `${path}:${f.startLine}` : `${path}:${f.startLine}-${f.endLine}`;
-};
-
-const tableCell = (s: string): string => sanitizeModelText(s).replace(/\|/g, "\\|");
 
 const severityBadge = (level: Finding["level"]): string =>
   Match.value(level).pipe(
