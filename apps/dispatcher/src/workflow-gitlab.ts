@@ -55,8 +55,11 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
     const { executionId, input } = event.payload;
     // CF types `step.do<T extends Rpc.Serializable<T>>`; our step results are
     // plain JSON records, so bridge through the simple `(name, cb)` view — the
-    // same narrowing workflow.ts uses.
-    const stepDo = step.do.bind(step) as unknown as StepDo;
+    // same narrowing workflow.ts uses. NOTE: `step` is an RPC stub — `step.do`
+    // must be invoked as a property call (receiver preserved); extracting it
+    // via `.bind(step)` throws `The RPC receiver does not implement "bind"`.
+    const stepDo: StepDo = (name, cb) =>
+      (step.do as unknown as StepDo)(name, cb);
     const db = this.env.RUNS_METADATA;
 
     // 1. Minimal executions row. GitLab has no GitHub-style repo slug — use the
