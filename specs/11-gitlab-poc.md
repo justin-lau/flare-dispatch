@@ -104,6 +104,19 @@ wrangler deploy --config $CFG
    verification. GitLab sends `X-Gitlab-Token` = the secret; the route
    constant-time-compares it.
 
+## Shared internals + follow-ups
+
+- **Comment sanitizers** — the model-output hardening (`sanitizeModelText`,
+  `encodeFindingPath`, `findingLoc`, `tableCell`) lives in
+  `packages/review-agent/src/comment-sanitize.ts` and is consumed by `mr-review`.
+  `pr-review` keeps its own **byte-identical** private copies for now so the
+  GitHub path stays untouched. **Follow-up:** fold `pr-review` onto the shared
+  module (a mechanical swap once the GitHub path is re-verified byte-for-byte).
+- **Note posting is its own Workflow step.** `mrReviewCompute` fetches + reviews
+  + renders the note *without posting*; `GitlabReviewWorkflow` posts it in a
+  separate `post-review` step, so a mid-flight Workflow replay re-runs neither
+  the model fan-out nor the note post twice.
+
 ## Phased upstream outline
 
 The PoC is intentionally shaped so upstreaming is incremental, each phase
