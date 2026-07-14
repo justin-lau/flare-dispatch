@@ -18,6 +18,7 @@
     "@flare-dispatch/bedrock-sigv4": "workspace:*",
     "@flare-dispatch/core": "workspace:*",
     "@flare-dispatch/github-app": "workspace:*",
+    "@flare-dispatch/gitlab-app": "workspace:*",
     "effect": "^3.21.0"
   },
   "devDependencies": {

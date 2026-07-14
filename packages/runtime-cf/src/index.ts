@@ -83,6 +83,11 @@ export {
   type ModelUsageSink,
 } from "./model-gateway-cf";
 export {
+  makeGitlabScmLive,
+  scmReasonFor,
+  type GitlabScmConfig,
+} from "./scm-gitlab";
+export {
   recordExecutionCost,
   instanceForSandboxImage,
 } from "./execution-cost";
@@ -94,6 +99,7 @@ export {
   GithubDeferred,
   ModelGatewayDeferred,
   OidcDeferred,
+  ScmDeferred,
 } from "./deferred";
 export {
   makeOidcLive,

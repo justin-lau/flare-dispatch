@@ -286,6 +286,9 @@ importers:
       '@flare-dispatch/github-app':
         specifier: workspace:*
         version: link:../github-app
+      '@flare-dispatch/gitlab-app':
+        specifier: workspace:*
+        version: link:../gitlab-app
       effect:
         specifier: ^3.21.0
         version: 3.21.2

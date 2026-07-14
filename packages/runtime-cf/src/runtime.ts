@@ -48,6 +48,7 @@ import {
   ConfigDeferred,
   ModelGatewayDeferred,
   OidcDeferred,
+  ScmDeferred,
 } from "./deferred";
 import {
   type CloudflareLiveConfig,
@@ -387,6 +388,11 @@ export const makeCFRuntimeLive = (
     github,
     cloudflare,
     modelGateway,
+    // `Scm` (the provider-neutral GitLab/GitHub review seam) is only wired live
+    // by the GitLab PoC entry (apps/dispatcher/src/index.poc.ts) — the primary
+    // runtime has no SCM provider, so the dying stub keeps the Tag satisfied
+    // for `RunContext` without any existing run touching it.
+    ScmDeferred,
     oidcLayer,
     childRuns,
     executions,

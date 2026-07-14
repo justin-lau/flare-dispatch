@@ -31,6 +31,9 @@ import {
   Oidc,
   OidcSigningFailed,
   type OidcService,
+  Scm,
+  ScmError,
+  type ScmService,
 } from "@flare-dispatch/core";
 
 /** Browser — Browser Rendering binding deferred to V2 (PR9). */
@@ -175,6 +178,32 @@ export const ModelGatewayDeferred: Layer.Layer<ModelGateway> = Layer.succeed(
           reason: "unknown",
           message: "modelGateway.complete: no Workers AI (`AI`) binding on this deploy",
         }),
+      ),
+  }))(),
+);
+
+/**
+ * Scm — the fallback when a deploy has no SCM (GitLab) provider wired. The Tag
+ * is always supplied so a review run can be tested against `ScmFake`; a live
+ * deploy without a backing provider fails `fetchDiff` with a typed `ScmError`
+ * (`reason: "unknown"`) and no-ops `postReview` (reporting must never fail a
+ * run). Only the `mr-review` recipe touches the Tag; wire `makeGitlabScmLive`
+ * when the `GITLAB_TOKEN` is present.
+ */
+export const ScmDeferred: Layer.Layer<Scm> = Layer.succeed(
+  Scm,
+  ((): ScmService => ({
+    fetchDiff: () =>
+      Effect.fail(
+        new ScmError({
+          provider: "none",
+          reason: "unknown",
+          message: "scm.fetchDiff: no SCM provider wired on this deploy",
+        }),
+      ),
+    postReview: ({ ref }) =>
+      Effect.logInfo(
+        `scm.postReview skipped (no SCM provider) — note on ${ref.project}!${ref.number} not posted`,
       ),
   }))(),
 );
