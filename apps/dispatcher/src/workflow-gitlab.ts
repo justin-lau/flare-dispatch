@@ -91,9 +91,9 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
         this.env.CONFIG_KV === undefined
           ? ConfigDeferred
           : makeConfigKvLive(this.env.CONFIG_KV);
-      const scmLayer = makeGitlabScmLive({
-        ...(this.env.GITLAB_TOKEN !== undefined ? { token: this.env.GITLAB_TOKEN } : {}),
-      });
+      const scmLayer = makeGitlabScmLive(
+        this.env.GITLAB_TOKEN !== undefined ? { token: this.env.GITLAB_TOKEN } : {},
+      );
       const layer = Layer.mergeAll(modelLayer, configLayer, scmLayer);
 
       const exit = await Effect.runPromiseExit(
