@@ -88,13 +88,134 @@ import {
   type ModelCompletionRequest,
   type ModelCompletionResult,
   ModelGatewayError,
-  type ModelGatewayService,
+  type ModelMessage,
   type ModelToolCall,
+  type ModelGatewayService,
 } from "@flare-dispatch/core";
 import { invokeBedrockViaAiGateway } from "./bedrock-invoke";
 
-/** A `messages` entry sent to Workers AI. */
-type AiMessage = { readonly role: string; readonly content: string };
+/**
+ * A `messages` entry sent to Workers AI. The base case is `{role, content}`; the
+ * agentic transcript path additionally carries the OpenAI-shaped `tool_calls`
+ * (assistant turns that called a tool) and `tool_call_id`/`name` (tool-result
+ * turns) so a Workers AI chat model can follow a multi-turn tool loop.
+ */
+type AiMessage = {
+  readonly role: string;
+  readonly content: string;
+  readonly tool_calls?: ReadonlyArray<OpenAiWireToolCall>;
+  readonly tool_call_id?: string;
+  readonly name?: string;
+};
+
+/** The OpenAI wire shape for one assistant tool call (also what Workers AI accepts). */
+type OpenAiWireToolCall = {
+  readonly id: string;
+  readonly type: "function";
+  readonly function: { readonly name: string; readonly arguments: string };
+};
+
+// ---------------------------------------------------------------------------
+// Multi-turn transcript mapping (agentic mode) — shared across routes.
+
+/** Stringify a tool call's provider-shaped `arguments` to the OpenAI wire form
+ *  (a JSON string). A value already a string passes through verbatim. */
+const argsToWire = (args: unknown): string =>
+  typeof args === "string" ? args : JSON.stringify(args ?? {});
+
+/** Map a {@link ModelMessage}'s tool calls onto the OpenAI wire `tool_calls`. */
+const toWireToolCalls = (
+  calls: ReadonlyArray<ModelToolCall>,
+): ReadonlyArray<OpenAiWireToolCall> =>
+  calls.map((c, i) => ({
+    id: c.id ?? `call_${i}`,
+    type: "function" as const,
+    function: { name: c.name, arguments: argsToWire(c.arguments) },
+  }));
+
+/**
+ * Map a {@link ModelMessage} onto one OpenAI-shaped chat message (used by the
+ * OpenRouter route and, folding aside, Workers AI). Assistant tool calls become
+ * `tool_calls`; a tool result carries `tool_call_id` + `name`.
+ */
+const toOpenAiMessage = (m: ModelMessage): AiMessage => {
+  if (m.role === "assistant" && m.toolCalls !== undefined && m.toolCalls.length > 0) {
+    return { role: "assistant", content: m.content, tool_calls: toWireToolCalls(m.toolCalls) };
+  }
+  if (m.role === "tool") {
+    return {
+      role: "tool",
+      content: m.content,
+      ...(m.toolCallId !== undefined ? { tool_call_id: m.toolCallId } : {}),
+      ...(m.name !== undefined ? { name: m.name } : {}),
+    };
+  }
+  return { role: m.role, content: m.content };
+};
+
+/**
+ * Fold a transcript's system message(s) into the FIRST user message and drop the
+ * system role — the Workers AI chat-template quirk (system dropped when tools are
+ * present) applies to the agentic path too. Non-tools Workers AI calls keep the
+ * system role verbatim.
+ */
+const foldSystemIntoFirstUser = (
+  messages: ReadonlyArray<AiMessage>,
+): ReadonlyArray<AiMessage> => {
+  const systemText = messages
+    .filter((m) => m.role === "system")
+    .map((m) => m.content)
+    .join("\n\n");
+  if (systemText === "") return messages;
+  const rest = messages.filter((m) => m.role !== "system");
+  const firstUserIdx = rest.findIndex((m) => m.role === "user");
+  if (firstUserIdx < 0) return [{ role: "user", content: systemText }, ...rest];
+  return rest.map((m, i) =>
+    i === firstUserIdx ? { ...m, content: `${systemText}\n\n${m.content}` } : m,
+  );
+};
+
+/**
+ * Flatten a transcript into a single `{system, user}` pair — the degradation the
+ * non-native routes (anthropic / deepseek / bedrock) use when `messages` is set.
+ * Agentic NATIVE support is openrouter + workers-ai only for the PoC; here the
+ * whole conversation (assistant turns, tool calls, tool results) is rendered into
+ * the user string so nothing breaks, just without true multi-turn tool calling.
+ */
+const flattenTranscript = (
+  messages: ReadonlyArray<ModelMessage>,
+): { readonly system: string; readonly user: string } => {
+  const system = messages
+    .filter((m) => m.role === "system")
+    .map((m) => m.content)
+    .join("\n\n");
+  const user = messages
+    .filter((m) => m.role !== "system")
+    .map((m) => {
+      if (m.role === "assistant") {
+        const calls =
+          m.toolCalls !== undefined && m.toolCalls.length > 0
+            ? `\n[tool calls: ${m.toolCalls
+                .map((c) => `${c.name}(${argsToWire(c.arguments)})`)
+                .join(", ")}]`
+            : "";
+        return `Assistant: ${m.content}${calls}`;
+      }
+      if (m.role === "tool") return `Tool result (${m.name ?? "tool"}): ${m.content}`;
+      return `User: ${m.content}`;
+    })
+    .join("\n\n");
+  return { system, user };
+};
+
+/** Effective single-turn `{system, user}` for a request — the flattened
+ *  transcript when `messages` is set, else the plain `system`/`user` fields. */
+const effectiveSystemUser = (
+  req: ModelCompletionRequest,
+): { readonly system: string; readonly user: string } =>
+  req.messages !== undefined
+    ? flattenTranscript(req.messages)
+    : { system: req.system, user: req.user };
 
 /** A `tools` entry sent to Workers AI (the OpenAI-style function-tool shape). */
 type AiTool = {
@@ -153,13 +274,14 @@ const jsonResponseFormat = (
  * `readToolCalls` below fall back to the chat-completion shape.
  */
 type AiChatToolCall = {
+  readonly id?: string;
   readonly name?: string;
   readonly arguments?: unknown;
   readonly function?: { readonly name?: string; readonly arguments?: unknown };
 };
 type AiTextOutput = {
   readonly response?: string;
-  readonly tool_calls?: ReadonlyArray<{ name: string; arguments: unknown }>;
+  readonly tool_calls?: ReadonlyArray<{ id?: string; name: string; arguments: unknown }>;
   readonly choices?: ReadonlyArray<{
     readonly message?: {
       readonly content?: string | null;
@@ -200,13 +322,18 @@ const readText = (output: AiTextOutput): string => {
  */
 const readToolCalls = (output: AiTextOutput): ReadonlyArray<ModelToolCall> => {
   if (output.tool_calls !== undefined && output.tool_calls.length > 0) {
-    return output.tool_calls.map((c) => ({ name: c.name, arguments: c.arguments }));
+    return output.tool_calls.map((c) => ({
+      name: c.name,
+      arguments: c.arguments,
+      ...(typeof c.id === "string" ? { id: c.id } : {}),
+    }));
   }
   const fromChoice = output.choices?.[0]?.message?.tool_calls ?? [];
   return fromChoice
     .map((c) => ({
       name: c.name ?? c.function?.name,
       arguments: c.arguments ?? c.function?.arguments,
+      ...(typeof c.id === "string" ? { id: c.id } : {}),
     }))
     .filter((c): c is ModelToolCall => typeof c.name === "string");
 };
@@ -315,15 +442,19 @@ type AnthropicContentBlock = {
   readonly input?: unknown;
 };
 
-/** Build the Anthropic Messages API request body from a completion request. */
+/** Build the Anthropic Messages API request body from a completion request.
+ *  Agentic transcripts (`req.messages`) are flattened into one system+user pair
+ *  — native multi-turn tool calling is openrouter + workers-ai only for the PoC. */
 const anthropicBody = (
   req: ModelCompletionRequest,
   model: string,
-): unknown => ({
+): unknown => {
+  const { system, user } = effectiveSystemUser(req);
+  return {
   model,
   max_tokens: req.maxTokens ?? ANTHROPIC_DEFAULT_MAX_TOKENS,
-  system: req.system,
-  messages: [{ role: "user", content: req.user }],
+  system,
+  messages: [{ role: "user", content: user }],
   ...(req.tools !== undefined && req.tools.length > 0
     ? {
         tools: req.tools.map((t) => ({
@@ -337,7 +468,8 @@ const anthropicBody = (
       }
     : {}),
   ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-});
+  };
+};
 
 /** Map Anthropic `content` blocks onto the capability's `{toolCalls, text}`. */
 const fromAnthropicContent = (
@@ -365,13 +497,20 @@ const completeWorkersAi = (
       // message when `tools` are present — identical prompt token counts with
       // and without it. Fold the system instruction into the user message on
       // the tools path so it actually reaches the model; keep the separate
-      // system role on the plain-text path, where templates honour it.
-      messages: sendingTools
-        ? [{ role: "user", content: `${req.system}\n\n${req.user}` }]
-        : [
-            { role: "system", content: req.system },
-            { role: "user", content: req.user },
-          ],
+      // system role on the plain-text path, where templates honour it. The
+      // agentic transcript path (`req.messages`) maps every turn through and
+      // applies the SAME system-fold when tools are present.
+      messages:
+        req.messages !== undefined
+          ? sendingTools
+            ? foldSystemIntoFirstUser(req.messages.map(toOpenAiMessage))
+            : req.messages.map(toOpenAiMessage)
+          : sendingTools
+            ? [{ role: "user", content: `${req.system}\n\n${req.user}` }]
+            : [
+                { role: "system", content: req.system },
+                { role: "user", content: req.user },
+              ],
       ...(sendingTools
         ? {
             tools: (req.tools ?? []).map((t) => ({
@@ -524,6 +663,9 @@ const DEEPSEEK_DEFAULT_MAX_TOKENS = 2048;
 
 /** The slice of an OpenAI Chat Completions `tool_calls` entry this Layer reads. */
 type OpenAiToolCall = {
+  /** The provider's call id — echoed back on the assistant turn + tool result
+   *  in an agentic transcript so the wire's `tool_call_id` pairs correctly. */
+  readonly id?: string;
   readonly function?: { readonly name?: string; readonly arguments?: unknown };
 };
 
@@ -548,16 +690,20 @@ type OpenAiChatResponse = {
   };
 };
 
-/** Build the OpenAI Chat Completions request body for DeepSeek. */
+/** Build the OpenAI Chat Completions request body for DeepSeek. Agentic
+ *  transcripts are flattened into one system+user pair (native multi-turn tool
+ *  calling is openrouter + workers-ai only for the PoC). */
 const deepseekBody = (
   req: ModelCompletionRequest,
   model: string,
-): unknown => ({
+): unknown => {
+  const { system, user } = effectiveSystemUser(req);
+  return {
   model,
   max_tokens: req.maxTokens ?? DEEPSEEK_DEFAULT_MAX_TOKENS,
   messages: [
-    { role: "system", content: req.system },
-    { role: "user", content: req.user },
+    { role: "system", content: system },
+    { role: "user", content: user },
   ],
   ...(req.tools !== undefined && req.tools.length > 0
     ? {
@@ -583,7 +729,8 @@ const deepseekBody = (
     ? { response_format: { type: "json_object" } }
     : {}),
   ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-});
+  };
+};
 
 /** Map an OpenAI Chat Completions response onto the capability's `{toolCalls, text}`. */
 const fromOpenAiChat = (
@@ -594,9 +741,11 @@ const fromOpenAiChat = (
     .filter((c) => typeof c.function?.name === "string")
     // `arguments` is a JSON STRING (OpenAI shape); pass it through verbatim —
     // the engine's `parseToolArguments` JSON-parses a string before decode.
+    // Preserve the provider `id` for the agentic transcript's tool-result pairing.
     .map((c) => ({
       name: c.function!.name as string,
       arguments: c.function?.arguments,
+      ...(typeof c.id === "string" ? { id: c.id } : {}),
     }));
   const reasoningTokens = parsed.usage?.completion_tokens_details?.reasoning_tokens;
   return {
@@ -729,22 +878,51 @@ const OPENROUTER_TITLE = "flare-dispatch";
 
 /**
  * Build the OpenRouter request body — the OpenAI Chat Completions shape plus
- * `usage:{include:true}` (opt into cost accounting). The engine drives this
- * backend in json/prompt mode (no tools), so `response_format: json_object` is
- * set when a json schema is present; tool-calling is intentionally unsupported.
+ * `usage:{include:true}` (opt into cost accounting).
+ *
+ * Two drive modes share this builder:
+ *   - single-shot json/prompt mode (no tools): `response_format: json_object`
+ *     when a json schema is present. The single-shot review path.
+ *   - AGENTIC multi-turn: `req.messages` carries the transcript (assistant tool
+ *     calls + `tool`-role results, mapped to the OpenAI wire shape) and
+ *     `req.tools` the offered tools (`tool_choice: "auto"` so the model may call
+ *     a retrieval tool OR answer). Tools and `response_format` are mutually
+ *     exclusive here, so json mode is suppressed while tools are offered.
  */
-const openRouterBody = (req: ModelCompletionRequest, model: string): unknown => ({
-  model,
-  max_tokens: req.maxTokens ?? OPENROUTER_DEFAULT_MAX_TOKENS,
-  messages: [
-    { role: "system", content: req.system },
-    { role: "user", content: req.user },
-  ],
-  ...(req.jsonSchema !== undefined ? { response_format: { type: "json_object" } } : {}),
-  ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-  // Opt into OpenRouter usage accounting → usage.cost + reasoning_tokens.
-  usage: { include: true },
-});
+const openRouterBody = (req: ModelCompletionRequest, model: string): unknown => {
+  const sendingTools = req.tools !== undefined && req.tools.length > 0;
+  return {
+    model,
+    max_tokens: req.maxTokens ?? OPENROUTER_DEFAULT_MAX_TOKENS,
+    messages:
+      req.messages !== undefined
+        ? req.messages.map(toOpenAiMessage)
+        : [
+            { role: "system", content: req.system },
+            { role: "user", content: req.user },
+          ],
+    ...(sendingTools
+      ? {
+          tools: (req.tools ?? []).map((t) => ({
+            type: "function",
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: t.parameters,
+            },
+          })),
+          // Let the model choose: call an offered tool, or answer directly.
+          tool_choice: "auto",
+        }
+      : {}),
+    ...(req.jsonSchema !== undefined && !sendingTools
+      ? { response_format: { type: "json_object" } }
+      : {}),
+    ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
+    // Opt into OpenRouter usage accounting → usage.cost + reasoning_tokens.
+    usage: { include: true },
+  };
+};
 
 /**
  * The OpenRouter route — a direct POST with the deploy's `OPENROUTER_API_KEY`.
@@ -838,11 +1016,13 @@ const BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31";
  * Anthropic models is the Anthropic Messages API body MINUS the `model` field
  * (the model id is in the URL) PLUS an `anthropic_version` field.
  */
-const bedrockAnthropicBody = (req: ModelCompletionRequest): unknown => ({
+const bedrockAnthropicBody = (req: ModelCompletionRequest): unknown => {
+  const { system, user } = effectiveSystemUser(req);
+  return {
   anthropic_version: BEDROCK_ANTHROPIC_VERSION,
   max_tokens: req.maxTokens ?? BEDROCK_DEFAULT_MAX_TOKENS,
-  system: req.system,
-  messages: [{ role: "user", content: req.user }],
+  system,
+  messages: [{ role: "user", content: user }],
   ...(req.tools !== undefined && req.tools.length > 0
     ? {
         tools: req.tools.map((t) => ({
@@ -855,7 +1035,8 @@ const bedrockAnthropicBody = (req: ModelCompletionRequest): unknown => ({
       }
     : {}),
   ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-});
+  };
+};
 
 /**
  * The Bedrock route. Pinned to AI Gateway: requires both a `cloudflareAccountId`

@@ -837,4 +837,163 @@ describe("makeModelGatewayLive — openrouter direct route", () => {
     );
     expect(exit._tag).toBe("Failure");
   });
+
+  // --- Agentic multi-turn (messages transcript + tools) --------------------
+
+  it("maps an agentic transcript + tools faithfully (messages precedence, wire tool_calls, tool role, tool_choice auto)", async () => {
+    const { fetchImpl, seen } = stubFetch({
+      choices: [{ message: { content: "", tool_calls: [] } }],
+    });
+    await withFetch(fetchImpl, () =>
+      Effect.runPromise(
+        modelGateway
+          .complete({
+            model: "openrouter/deepseek/deepseek-v4-pro",
+            // system/user are IGNORED when messages is present.
+            system: "ignored",
+            user: "ignored",
+            jsonSchema: { type: "object" },
+            messages: [
+              { role: "system", content: "you are a reviewer" },
+              { role: "user", content: "review this diff" },
+              {
+                role: "assistant",
+                content: "",
+                toolCalls: [
+                  { id: "call_abc", name: "hakiri_search", arguments: { query: "helper" } },
+                ],
+              },
+              {
+                role: "tool",
+                toolCallId: "call_abc",
+                name: "hakiri_search",
+                content: "search result text",
+              },
+            ],
+            tools: [
+              { name: "hakiri_search", description: "search", parameters: { type: "object" } },
+              { name: "submit_review", description: "submit", parameters: { type: "object" } },
+            ],
+            maxTokens: 4096,
+          })
+          .pipe(Effect.provide(withKey("sk-or-secret"))),
+      ),
+    );
+
+    const body = JSON.parse(seen.body!) as Record<string, unknown>;
+    // messages take precedence over system/user, mapped to the OpenAI wire shape —
+    // assistant tool_calls carry the id + stringified arguments; the tool result
+    // pairs back by tool_call_id.
+    expect(body.messages).toEqual([
+      { role: "system", content: "you are a reviewer" },
+      { role: "user", content: "review this diff" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call_abc",
+            type: "function",
+            function: { name: "hakiri_search", arguments: '{"query":"helper"}' },
+          },
+        ],
+      },
+      { role: "tool", content: "search result text", tool_call_id: "call_abc", name: "hakiri_search" },
+    ]);
+    // tools forwarded in the OpenAI function shape; the model is free to choose.
+    expect(body.tools).toEqual([
+      { type: "function", function: { name: "hakiri_search", description: "search", parameters: { type: "object" } } },
+      { type: "function", function: { name: "submit_review", description: "submit", parameters: { type: "object" } } },
+    ]);
+    expect(body.tool_choice).toBe("auto");
+    // response_format is suppressed while tools are offered (mutually exclusive).
+    expect("response_format" in body).toBe(false);
+    // usage accounting still opted in.
+    expect(body.usage).toEqual({ include: true });
+  });
+
+  it("preserves the provider tool-call id on the result (for transcript pairing)", async () => {
+    const { fetchImpl } = stubFetch({
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              { id: "call_xyz", type: "function", function: { name: "submit_review", arguments: '{"findings":[]}' } },
+            ],
+          },
+        },
+      ],
+    });
+    const result = await withFetch(fetchImpl, () =>
+      Effect.runPromise(
+        modelGateway
+          .complete({ model: "openrouter/x", system: "s", user: "u" })
+          .pipe(Effect.provide(withKey("k"))),
+      ),
+    );
+    expect(result.toolCalls).toEqual([
+      { name: "submit_review", arguments: '{"findings":[]}', id: "call_xyz" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agentic multi-turn transcript on the Workers AI route.
+
+describe("makeModelGatewayLive — agentic transcript (workers-ai)", () => {
+  it("maps a transcript through ai.run and folds system into the first user turn when tools are present", async () => {
+    const { ai, seen } = stubAi({ response: "", tool_calls: [] });
+    await run(ai, undefined, {
+      model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      system: "unused",
+      user: "unused",
+      messages: [
+        { role: "system", content: "SYS" },
+        { role: "user", content: "USER" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "c1", name: "hakiri_search", arguments: { query: "q" } }],
+        },
+        { role: "tool", toolCallId: "c1", name: "hakiri_search", content: "RESULT" },
+      ],
+      tools: [{ name: "submit_review", description: "d", parameters: { type: "object" } }],
+    });
+
+    // The Workers AI tools quirk (system dropped when tools present) applies to
+    // the transcript path: system is folded into the first user turn.
+    expect((seen.inputs as { messages: unknown }).messages).toEqual([
+      { role: "user", content: "SYS\n\nUSER" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "c1", type: "function", function: { name: "hakiri_search", arguments: '{"query":"q"}' } },
+        ],
+      },
+      { role: "tool", content: "RESULT", tool_call_id: "c1", name: "hakiri_search" },
+    ]);
+    // tools forwarded in the Workers AI function shape.
+    expect((seen.inputs as { tools: unknown }).tools).toEqual([
+      { type: "function", function: { name: "submit_review", description: "d", parameters: { type: "object" } } },
+    ]);
+  });
+
+  it("keeps the system role verbatim on a transcript with no tools", async () => {
+    const { ai, seen } = stubAi({ response: '{"findings":[]}' });
+    await run(ai, undefined, {
+      model: "m",
+      system: "unused",
+      user: "unused",
+      messages: [
+        { role: "system", content: "SYS" },
+        { role: "user", content: "USER" },
+      ],
+    });
+    expect((seen.inputs as { messages: unknown }).messages).toEqual([
+      { role: "system", content: "SYS" },
+      { role: "user", content: "USER" },
+    ]);
+  });
 });

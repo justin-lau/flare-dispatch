@@ -44,6 +44,40 @@ export type ModelToolCall = {
    * the capability passes whatever the backend returned through verbatim.
    */
   readonly arguments: unknown;
+  /**
+   * Optional call id correlating an assistant tool call with its `tool`-role
+   * result in a multi-turn transcript (see {@link ModelMessage}). Backends that
+   * surface one on the response pass it through; the agentic driver otherwise
+   * synthesizes a stable id so the OpenAI wire shape (`tool_call_id`) can pair
+   * results back to calls. Single-turn callers ignore it.
+   */
+  readonly id?: string;
+};
+
+/**
+ * One message in a multi-turn transcript — the unit an AGENTIC run threads back
+ * to the model so it can iterate (call a retrieval tool, read the result, call
+ * again) across turns. Present on {@link ModelCompletionRequest.messages}; when
+ * that field is set it TAKES PRECEDENCE over the single-turn `system`/`user`.
+ *
+ *   - `system` / `user` / `assistant` — the usual chat roles. An `assistant`
+ *     message that itself called tools carries them on `toolCalls`.
+ *   - `tool` — the RESULT of one tool call, correlated back to the assistant's
+ *     call by `toolCallId` (and labelled with the tool `name`).
+ *
+ * Native multi-turn mapping is provided for the OpenRouter and Workers AI routes
+ * only (the PoC's agentic backends); other routes flatten the transcript into a
+ * single system+user pair.
+ */
+export type ModelMessage = {
+  readonly role: "system" | "user" | "assistant" | "tool";
+  readonly content: string;
+  /** Tool calls this assistant message emitted (assistant role only). */
+  readonly toolCalls?: ReadonlyArray<ModelToolCall>;
+  /** The `id` of the assistant tool call this result answers (tool role only). */
+  readonly toolCallId?: string;
+  /** The tool's name (tool role only) — informational for providers that want it. */
+  readonly name?: string;
 };
 
 /** A single-turn model request. */
@@ -60,6 +94,14 @@ export type ModelCompletionRequest = {
   readonly system: string;
   /** The user-role message. */
   readonly user: string;
+  /**
+   * A multi-turn transcript (agentic mode). When present it TAKES PRECEDENCE
+   * over `system`/`user`: the backend sends these messages verbatim instead of
+   * synthesizing the single system+user pair. Native mapping is implemented for
+   * the OpenRouter and Workers AI routes; the other routes flatten it back into
+   * one system+user pair (see the runtime layer). Absent → single-turn.
+   */
+  readonly messages?: ReadonlyArray<ModelMessage>;
   /**
    * Tools the model may call. When present, the backend is asked to call one
    * (forced tool choice where the provider supports it). Absent → a plain text

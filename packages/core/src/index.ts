@@ -129,6 +129,7 @@ export {
   type ModelCompletionResult,
   type ModelTool,
   type ModelToolCall,
+  type ModelMessage,
 } from "./services/model-gateway";
 export {
   email,
