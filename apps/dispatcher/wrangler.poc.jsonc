@@ -42,7 +42,7 @@
     {
       "binding": "RUNS_METADATA",
       "database_name": "flare-dispatch-gitlab-poc",
-      "database_id": "TBD-AT-DEPLOY",
+      "database_id": "2289374b-600a-4a32-bc57-20ceb8dc2db5",
       "migrations_dir": "../../infra/migrations"
     }
   ],
@@ -53,7 +53,7 @@
   "kv_namespaces": [
     {
       "binding": "CONFIG_KV",
-      "id": "TBD-AT-DEPLOY"
+      "id": "87b1972101dc4ef6a3651fbadcd72aa5"
     }
     // IDEMPOTENCY_KV — optional receiver-level dedup on the GitLab delivery UUID
     // (env.ts marks it `?`; the webhook route guards every use). Left commented
