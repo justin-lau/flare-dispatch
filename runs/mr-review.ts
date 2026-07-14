@@ -170,7 +170,7 @@ export type MrComputeResult = {
 /** Render the "could not complete" failure note — the reason is model-influenced
  *  (it can carry provider/model error text), so it is sanitized before it lands
  *  in the public note. */
-const failureNote = (reason: string): string =>
+export const failureNote = (reason: string): string =>
   [`⚠️ **mr-review could not complete**: ${sanitizeModelText(reason)}`, "", COMMENT_MARKER].join(
     "\n",
   );
@@ -420,7 +420,7 @@ const resolveGrounding = (
 const addOptional = (a: number | undefined, b: number | undefined): number | undefined =>
   a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
 
-const refFor = (input: MrReviewInput): ChangeRef => ({
+export const refFor = (input: MrReviewInput): ChangeRef => ({
   project: input.projectId,
   number: input.iid,
   headSha: input.headSha,
@@ -489,7 +489,7 @@ const MAX_RENDERED_FINDINGS = 25;
 /** Render the consolidated review as a GitLab-flavoured markdown note. The
  *  optional `footer` (the per-run cost line) renders just above the marker; it is
  *  `null` when the model reported no usage (see {@link costFooter}). */
-const renderReviewComment = (
+export const renderReviewComment = (
   input: Pick<MrReviewInput, "projectWebUrl" | "headSha">,
   output: typeof ReviewOutputSchema.Type,
   footer: string | null,

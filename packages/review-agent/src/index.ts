@@ -71,6 +71,7 @@ export {
   completeStructured,
   type ReviewDomainInput,
   reviewDomain,
+  renderDomainBody,
   type CoordinateInput,
   coordinate,
   coordinateReview,

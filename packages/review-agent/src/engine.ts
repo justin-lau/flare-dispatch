@@ -637,8 +637,10 @@ export const reviewDomain = (
     maxTokens: input.maxTokens ?? REVIEW_MAX_TOKENS,
   }).pipe(Effect.map((o) => o.findings));
 
-/** The domain-specific body of a reviewer's user message (no per-mode framing). */
-const renderDomainBody = (input: ReviewDomainInput): string =>
+/** The domain-specific body of a reviewer's user message (no per-mode framing).
+ *  Exported so the agentic reviewer (runs/mr-review-agentic.ts) builds its first
+ *  user message with the SAME shape the single-shot reviewer uses. */
+export const renderDomainBody = (input: ReviewDomainInput): string =>
   [
     `Review domain: ${input.agent}`,
     `Risk tier: ${input.tier}`,

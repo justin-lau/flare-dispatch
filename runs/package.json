@@ -16,6 +16,7 @@
     "./product-demo": "./product-demo.ts",
     "./pr-review": "./pr-review.ts",
     "./mr-review": "./mr-review.ts",
+    "./mr-review-agentic": "./mr-review-agentic.ts",
     "./email-otp-login": "./email-otp-login.ts",
     "./finops-audit": "./finops-audit.ts"
   },

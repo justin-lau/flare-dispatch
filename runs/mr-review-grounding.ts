@@ -195,11 +195,51 @@ export const assembleContext = (rows: readonly ContextRow[]): string => {
 const sqlLiteral = (s: string): string => `'${s.replace(/'/g, "''")}'`;
 
 /** Extract the `result.content[0].text` payload from an MCP tool-call envelope. */
-const toolText = (envelope: unknown): string => {
+export const toolText = (envelope: unknown): string => {
   const content = (envelope as { result?: { content?: unknown } })?.result?.content;
   if (!Array.isArray(content) || content.length === 0) return "";
   const first = content[0] as { text?: unknown };
   return typeof first.text === "string" ? first.text : "";
+};
+
+/** Per-call wall-clock ceiling for a hakiri MCP request (AbortSignal timeout). A
+ *  slow/hung tunnel must not stall a review turn — the call aborts and degrades. */
+export const HAKIRI_TIMEOUT_MS = 20_000;
+
+/** A hakiri MCP `tools/call` client — one `call(name, arguments)` closure with
+ *  the endpoint URL, JSON-RPC envelope, bearer header, and timeout baked in.
+ *  Throws on a non-2xx status or a transport/timeout error (the caller decides
+ *  how to degrade). Shared by {@link fetchContext} (single-shot grounding) and
+ *  the agentic tool loop (runs/mr-review-agentic.ts), so ONE MCP client exists. */
+export const makeHakiriCall = (
+  config: GroundingConfig,
+): ((name: string, argument: Record<string, unknown>) => Promise<unknown>) => {
+  const base = config.endpoint.replace(/\/$/, "");
+  const url = `${base}/mcp`;
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json",
+    ...(config.token !== undefined && config.token.length > 0
+      ? { authorization: `Bearer ${config.token}` }
+      : {}),
+  };
+  let id = 0;
+  return async (name, argument) => {
+    id += 1;
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: argument },
+      }),
+      signal: AbortSignal.timeout(HAKIRI_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`hakiri ${name} → ${res.status}`);
+    return res.json();
+  };
 };
 
 /**
@@ -215,32 +255,7 @@ export const fetchContext = (args: {
   readonly paths: readonly string[];
 }): Effect.Effect<string> =>
   Effect.tryPromise(async () => {
-    const base = args.config.endpoint.replace(/\/$/, "");
-    const url = `${base}/mcp`;
-    const headers: Record<string, string> = {
-      "content-type": "application/json",
-      accept: "application/json",
-      ...(args.config.token !== undefined && args.config.token.length > 0
-        ? { authorization: `Bearer ${args.config.token}` }
-        : {}),
-    };
-
-    let id = 0;
-    const call = async (name: string, argument: Record<string, unknown>): Promise<unknown> => {
-      id += 1;
-      const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id,
-          method: "tools/call",
-          params: { name, arguments: argument },
-        }),
-      });
-      if (!res.ok) throw new Error(`hakiri ${name} → ${res.status}`);
-      return res.json();
-    };
+    const call = makeHakiriCall(args.config);
 
     const fileRows: ContextRow[] = [];
     // 1. Full contents of the changed files that still exist on main.
