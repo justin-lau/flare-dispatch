@@ -26,6 +26,7 @@ import type { Mailbox } from "./services/mailbox";
 import type { ModelGateway } from "./services/model-gateway";
 import type { Oidc } from "./services/oidc";
 import type { Sandbox } from "./services/sandbox";
+import type { Scm } from "./services/scm";
 import type { StepRunner } from "./services/step-runner";
 
 /** The union of capability services every run Effect depends on. */
@@ -42,6 +43,7 @@ export type RunContext =
   | Github
   | Cloudflare
   | ModelGateway
+  | Scm
   | Oidc
   | ChildRuns
   | Executions

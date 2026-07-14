@@ -74,6 +74,11 @@ import {
   makeOidcFake,
 } from "./fakes/oidc-fake";
 import {
+  makeScmFake,
+  ScmFake,
+  type ScmFakeState,
+} from "./fakes/scm-fake";
+import {
   makeSandboxFake,
   SandboxFake,
   type SandboxFakeState,
@@ -159,6 +164,12 @@ export {
   type OidcFakeState,
 } from "./fakes/oidc-fake";
 export {
+  ScmFake,
+  makeScmFake,
+  type ScmFakeState,
+  type ScmFakeOptions,
+} from "./fakes/scm-fake";
+export {
   SandboxFake,
   makeSandboxFake,
   sandboxFakeProgram,
@@ -196,6 +207,7 @@ export const CFRuntimeTest: Layer.Layer<RunContext> = Layer.mergeAll(
   GithubFake,
   CloudflareFake,
   ModelGatewayFake,
+  ScmFake,
   OidcFake,
   ChildRunsFake,
   ExecutionsFake,
@@ -216,6 +228,7 @@ export type CFRuntimeTestHandles = {
   readonly github: GithubFakeState;
   readonly cloudflare: CloudflareFakeState;
   readonly modelGateway: ModelGatewayFakeState;
+  readonly scm: ScmFakeState;
   readonly oidc: OidcFakeState;
   readonly childRuns: ChildRunsFakeState;
   /** The inline runner's event queue — feed `step.waitForEvent` from tests. */
@@ -246,6 +259,8 @@ export type CFRuntimeTestOptions = {
   readonly cloudflare?: Parameters<typeof makeCloudflareFake>[0];
   /** ModelGateway fake script — answers `modelGateway.complete` returns. */
   readonly modelGateway?: Parameters<typeof makeModelGatewayFake>[0];
+  /** Scm fake options — the canned diff `scm.fetchDiff` returns. */
+  readonly scm?: Parameters<typeof makeScmFake>[0];
   /** Oidc fake options — issuer override + deterministic `iat` clock. */
   readonly oidc?: Parameters<typeof makeOidcFake>[0];
   /** ChildRuns fake options — instance ids to treat as already-created. */
@@ -290,6 +305,7 @@ export const makeCFRuntimeTest = (
   const github = makeGithubFake(opts.github);
   const cloudflare = makeCloudflareFake(opts.cloudflare);
   const modelGateway = makeModelGatewayFake(opts.modelGateway);
+  const scm = makeScmFake(opts.scm);
   const oidcLayer = makeOidcFake(opts.oidc);
   const childRuns = makeChildRunsFake(opts.childRuns);
   const executions = makeExecutionsFake();
@@ -312,6 +328,7 @@ export const makeCFRuntimeTest = (
     github.layer,
     cloudflare.layer,
     modelGateway.layer,
+    scm.layer,
     oidcLayer.layer,
     childRuns.layer,
     executions.layer,
@@ -331,6 +348,7 @@ export const makeCFRuntimeTest = (
       github: github.state,
       cloudflare: cloudflare.state,
       modelGateway: modelGateway.state,
+      scm: scm.state,
       oidc: oidcLayer.state,
       childRuns: childRuns.state,
       executions: executions.state,
