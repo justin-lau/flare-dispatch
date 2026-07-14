@@ -39,6 +39,11 @@ describe("resolvePricing", () => {
   it("returns undefined for an unknown model with no override", () => {
     expect(resolvePricing("@cf/unknown/model", undefined)).toBeUndefined();
   });
+
+  it("prices the gpt-oss bake-off candidates from the built-in table", () => {
+    expect(resolvePricing("@cf/openai/gpt-oss-120b", undefined)).toEqual([0.35, 0.75]);
+    expect(resolvePricing("@cf/openai/gpt-oss-20b", undefined)).toEqual([0.2, 0.3]);
+  });
 });
 
 describe("costOf", () => {

@@ -34,6 +34,10 @@ export const DEFAULT_PRICING: Readonly<Record<string, ModelPricing>> = {
   "@cf/qwen/qwen2.5-coder-32b-instruct": [0.66, 1.0],
   "@cf/meta/llama-3.1-8b-instruct-fast": [0.045, 0.38],
   "@cf/mistralai/mistral-small-3.1-24b-instruct": [0.35, 0.56],
+  // Likely next defaults after the bake-off (catalog ids verified against the
+  // @cloudflare/workers-types AI catalog).
+  "@cf/openai/gpt-oss-120b": [0.35, 0.75],
+  "@cf/openai/gpt-oss-20b": [0.2, 0.3],
 };
 
 /** USD per neuron — Workers AI bills $0.011 per 1,000 neurons. */
