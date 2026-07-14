@@ -17,21 +17,42 @@ const output = {
 
 afterEach(() => vi.restoreAllMocks());
 
+const usage = { inputTokens: 14230, outputTokens: 1872 };
+
 describe("reviewOutcome", () => {
-  it("success (output present) → status success + summaryJson + the note body", () => {
-    const compute: MrComputeResult = { output, noteBody: "the note" };
+  it("success (output present) → status success + summaryJson (output + usage) + the note body", () => {
+    const compute: MrComputeResult = { status: "success", output, usage, noteBody: "the note" };
     const out = reviewOutcome(Exit.succeed(compute));
     expect(out.status).toBe("success");
     expect(out.noteBody).toBe("the note");
-    expect(JSON.parse(out.summaryJson!)).toEqual(output);
+    // summary_json carries the review output AND the aggregated token usage.
+    expect(JSON.parse(out.summaryJson!)).toEqual({ ...output, usage });
   });
 
   it("compute-level failure (output null) → status failure, summaryJson null, failure note", () => {
-    const compute: MrComputeResult = { output: null, noteBody: "could not complete" };
+    const compute: MrComputeResult = {
+      status: "failure",
+      output: null,
+      usage: null,
+      noteBody: "could not complete",
+    };
     const out = reviewOutcome(Exit.succeed(compute));
     expect(out.status).toBe("failure");
     expect(out.summaryJson).toBeNull();
     expect(out.noteBody).toBe("could not complete");
+  });
+
+  it("skipped-quota (null note) → status skipped-quota, summaryJson null, posts NOTHING", () => {
+    const compute: MrComputeResult = {
+      status: "skipped-quota",
+      output: null,
+      usage: null,
+      noteBody: null,
+    };
+    const out = reviewOutcome(Exit.succeed(compute));
+    expect(out.status).toBe("skipped-quota");
+    expect(out.summaryJson).toBeNull();
+    expect(out.noteBody).toBeNull();
   });
 
   it("a DEFECT is logged (Cause.pretty) and yields a crash note", () => {

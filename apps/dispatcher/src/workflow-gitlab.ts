@@ -118,10 +118,13 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
 
     // 3. Post the note — its OWN durable step, so a replay after a completed
     //    post never re-posts the model fan-out's note. Best-effort: a post
-    //    failure is logged, never fails the (already-computed) review.
+    //    failure is logged, never fails the (already-computed) review. A `null`
+    //    body (skipped-quota) posts NOTHING — the run degraded gracefully.
     await stepDo("post-review", async () => {
+      const body = outcome.noteBody;
+      if (body === null) return { posted: false };
       await Effect.runPromise(
-        mrPostNote(input, outcome.noteBody).pipe(
+        mrPostNote(input, body).pipe(
           Effect.provide(scmLayer),
           Effect.catchAll((e) =>
             Effect.logWarning(`gitlab-review: posting MR note failed — ${String(e)}`),

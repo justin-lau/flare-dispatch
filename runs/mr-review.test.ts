@@ -10,6 +10,7 @@
 import { it } from "@effect/vitest";
 import { Effect, Exit, Layer } from "effect";
 import { describe, expect } from "vitest";
+import { ModelGatewayError } from "@flare-dispatch/core";
 import {
   makeConfigFake,
   makeModelGatewayFake,
@@ -88,6 +89,71 @@ describe("mr-review", () => {
       expect(body).toContain(
         `https://gitlab.com/group/proj/-/blob/${baseInput.headSha}/src/foo.ts#L10-12`,
       );
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("renders the per-run cost footer above the marker (usage + priced model)", () => {
+    const scmFake = makeScmFake({
+      diff: "diff --git a/src/foo.ts b/src/foo.ts\n@@ -1 +1 @@\n-a\n+b\n",
+    });
+    // The lone reviewer's model call reports token usage.
+    const modelFake = makeModelGatewayFake({
+      responses: [{ ...reportWithFinding, inputTokens: 14230, outputTokens: 1872 }],
+    });
+    const layer = Layer.mergeAll(
+      scmFake.layer,
+      modelFake.layer,
+      // Price the (otherwise unknown) test model via a CONFIG_KV override.
+      makeConfigFake({ ...backendConfig, "pr-review.pricing.@cf/test/model": "0.66,1.0" }),
+    );
+
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      const body = scmFake.state.postReviewCalls[0]!.body;
+      // The footer line sits just above the marker, priced from the override.
+      expect(body).toContain(
+        "⚙️ @cf/test/model · 14,230 in + 1,872 out tokens · ~1,024 neurons · ≈$0.0113",
+      );
+      const footerIdx = body.indexOf("⚙️ @cf/test/model");
+      const markerIdx = body.indexOf("<!-- flare-dispatch: mr-review -->");
+      expect(footerIdx).toBeGreaterThan(-1);
+      expect(footerIdx).toBeLessThan(markerIdx);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("no reported usage → NO footer line (never guesses token counts)", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n" });
+    // `reportWithFinding` carries no inputTokens/outputTokens.
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding] });
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake(backendConfig));
+
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      const body = scmFake.state.postReviewCalls[0]!.body;
+      expect(body).not.toContain("⚙️");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("rate-limited model (quota exhausted) → skipped-quota: NO note is posted", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n" });
+    // The lone reviewer's model call fails rate-limited → every reviewer fails.
+    const modelFake = makeModelGatewayFake({
+      responses: [
+        new ModelGatewayError({
+          model: "@cf/test/model",
+          reason: "rate-limited",
+          message: "429 Too Many Requests: daily neuron allowance exhausted",
+        }),
+      ],
+    });
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake(backendConfig));
+
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(mrReviewProgram(baseInput));
+      // The run still goes red (no output), but degrades gracefully:
+      expect(Exit.isFailure(exit)).toBe(true);
+      // …crucially it posts NOTHING — no scary failure note on a quota burn.
+      expect(scmFake.state.postReviewCalls).toHaveLength(0);
     }).pipe(Effect.provide(layer));
   });
 

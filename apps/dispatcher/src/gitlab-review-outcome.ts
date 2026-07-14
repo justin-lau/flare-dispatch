@@ -15,12 +15,15 @@ const MR_REVIEW_MARKER = "<!-- flare-dispatch: mr-review -->";
 
 /** What the review step yields for `finalize` + the `post-review` step. */
 export type ReviewOutcome = {
-  /** Terminal `executions.status`. */
-  readonly status: "success" | "failure";
-  /** `executions.summary_json` (the review output) — `null` on failure. */
+  /** Terminal `executions.status`. `skipped-quota` = model quota exhausted, no
+   *  note posted (graceful degradation). */
+  readonly status: "success" | "failure" | "skipped-quota";
+  /** `executions.summary_json` — the review output PLUS aggregated token usage;
+   *  `null` when the review didn't run (failure / skipped-quota). */
   readonly summaryJson: string | null;
-  /** The note body the `post-review` step posts. */
-  readonly noteBody: string;
+  /** The note body the `post-review` step posts — `null` means post NOTHING
+   *  (skipped-quota). */
+  readonly noteBody: string | null;
 };
 
 /**
@@ -34,8 +37,10 @@ export const reviewOutcome = (
 ): ReviewOutcome =>
   Exit.match(exit, {
     onSuccess: (r) => ({
-      status: r.output !== null ? ("success" as const) : ("failure" as const),
-      summaryJson: r.output !== null ? JSON.stringify(r.output) : null,
+      status: r.status,
+      // Persist the review output AND the aggregated token usage into
+      // summary_json so the D1 row carries the per-run cost inputs.
+      summaryJson: r.output !== null ? JSON.stringify({ ...r.output, usage: r.usage }) : null,
       noteBody: r.noteBody,
     }),
     onFailure: (cause) => {

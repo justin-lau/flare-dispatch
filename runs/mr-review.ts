@@ -29,11 +29,12 @@
 // Mode: GitLab merge_request webhook (open / reopen / update). Config namespace:
 // the shared `pr-review` (DEFAULT_NAMESPACE).
 
-import { Effect, Either, Match, Schema } from "effect";
+import { Effect, Either, Match, Ref, Schema } from "effect";
 import {
   config,
   defineRun,
-  type ModelGateway,
+  ModelGateway,
+  type ModelGatewayService,
   scm,
   type Scm,
   ScmError,
@@ -62,6 +63,14 @@ import {
   tableCell,
   type Tier,
 } from "@flare-dispatch/review-agent";
+import {
+  type CostUsage,
+  costFooter,
+  type ModelPricing,
+  parsePricingOverride,
+  pricingKey,
+  resolvePricing,
+} from "./mr-review-cost";
 
 /** Footer marker on every MR note this run posts — for idempotent updates. */
 const COMMENT_MARKER = "<!-- flare-dispatch: mr-review -->";
@@ -126,14 +135,26 @@ const planForMode = (mode: AgentMode, tier: Tier): Plan =>
 type ReviewOutput = typeof ReviewOutputSchema.Type;
 
 /**
- * The result of {@link mrReviewCompute}: the review output (`null` when the
- * review could not complete) and the FULLY RENDERED note body to post — success
- * or failure. Carrying the body (rather than posting inline) lets the caller
- * post it as a SEPARATE durable step (see {@link mrPostNote}).
+ * The result of {@link mrReviewCompute}:
+ *
+ *   * `status` — the terminal outcome the D1 row records:
+ *       - `success`       a review ran (approve / comment / request-changes).
+ *       - `failure`       the review could not complete (non-quota error).
+ *       - `skipped-quota` the model quota was exhausted (rate-limited) — the run
+ *                         degrades gracefully: NO note is posted, just a warning.
+ *   * `output` — the review verdict (`null` on failure / skipped-quota).
+ *   * `noteBody` — the FULLY RENDERED note body to post, or `null` when nothing
+ *                  should be posted (skipped-quota). Carrying the body (rather
+ *                  than posting inline) lets the caller post it as a SEPARATE
+ *                  durable step (see {@link mrPostNote}).
+ *   * `usage` — aggregated model token usage across the fan-out (`null` when the
+ *               review didn't run) — persisted into the D1 `summary_json`.
  */
 export type MrComputeResult = {
+  readonly status: "success" | "failure" | "skipped-quota";
   readonly output: ReviewOutput | null;
-  readonly noteBody: string;
+  readonly noteBody: string | null;
+  readonly usage: CostUsage | null;
 };
 
 /** Render the "could not complete" failure note — the reason is model-influenced
@@ -157,13 +178,45 @@ export const mrReviewCompute = (
   input: MrReviewInput,
 ): Effect.Effect<MrComputeResult, never, Config | ModelGateway | Scm> =>
   reviewBody(input).pipe(
-    Effect.map(
-      (output): MrComputeResult => ({ output, noteBody: renderReviewComment(input, output) }),
-    ),
+    Effect.map((r): MrComputeResult => {
+      const footer = costFooter({ model: r.model, usage: r.usage, pricing: r.pricing });
+      return {
+        status: "success",
+        output: r.output,
+        usage: r.usage,
+        noteBody: renderReviewComment(input, r.output, footer),
+      };
+    }),
     Effect.catchAll((err) =>
-      Effect.succeed<MrComputeResult>({ output: null, noteBody: failureNote(describeError(err)) }),
+      // QUOTA-GRACEFUL DEGRADATION: a rate-limited model failure (free-plan
+      // neuron exhaustion → 429) is NOT posted as a failure note — it just logs a
+      // warning and records `skipped-quota` so a burned-through daily allowance
+      // doesn't spam every open MR with a scary "could not complete" note. Any
+      // OTHER failure keeps the visible failure note.
+      isRateLimited(err)
+        ? Effect.logWarning(
+            `mr-review: model quota exhausted (rate-limited) — skipping MR note for project ${input.projectId} !${input.iid}`,
+          ).pipe(
+            Effect.as<MrComputeResult>({
+              status: "skipped-quota",
+              output: null,
+              usage: null,
+              noteBody: null,
+            }),
+          )
+        : Effect.succeed<MrComputeResult>({
+            status: "failure",
+            output: null,
+            usage: null,
+            noteBody: failureNote(describeError(err)),
+          }),
     ),
   );
+
+/** A rate-limited model failure — the ONLY error that degrades to skipped-quota
+ *  (matched on the typed `reason`, never a message string). */
+const isRateLimited = (err: unknown): boolean =>
+  err instanceof ModelCallFailed && err.reason === "rate-limited";
 
 /** Post a review note for a change. Exported so the PoC Workflow posts it as its
  *  OWN durable step (idempotent — a replay after a completed post never re-posts). */
@@ -181,19 +234,33 @@ export const mrReviewProgram = (
   input: MrReviewInput,
 ): Effect.Effect<ReviewOutput, StepFailed, Config | ModelGateway | Scm> =>
   mrReviewCompute(input).pipe(
-    Effect.flatMap((r) =>
-      mrPostNote(input, r.noteBody).pipe(
-        // Best-effort — a post failure must not mask the review's verdict.
-        Effect.catchAll((e) =>
-          Effect.logWarning(`mr-review: posting MR note failed — ${describeError(e)}`),
-        ),
+    Effect.flatMap((r) => {
+      // A `null` body means "post nothing" (skipped-quota) — otherwise post
+      // best-effort (a post failure must not mask the review's verdict).
+      const post =
+        r.noteBody !== null
+          ? mrPostNote(input, r.noteBody).pipe(
+              Effect.catchAll((e) =>
+                Effect.logWarning(`mr-review: posting MR note failed — ${describeError(e)}`),
+              ),
+            )
+          : Effect.void;
+      return post.pipe(
         Effect.flatMap(() =>
           r.output !== null
             ? Effect.succeed(r.output)
-            : Effect.fail(new StepFailed({ step: "mr-review", cause: "review could not complete" })),
+            : Effect.fail(
+                new StepFailed({
+                  step: "mr-review",
+                  cause:
+                    r.status === "skipped-quota"
+                      ? "model quota exhausted — review skipped"
+                      : "review could not complete",
+                }),
+              ),
         ),
-      ),
-    ),
+      );
+    }),
   );
 
 const reviewBody = (input: MrReviewInput) =>
@@ -219,9 +286,28 @@ const reviewBody = (input: MrReviewInput) =>
     const guidelines = yield* config.get(guidelinesKey(NS));
     const systemPrompt = composeSystemPromptLocal(DEFAULT_REVIEW_SYSTEM_PROMPT, guidelines);
 
-    // 6. Fault-isolated fan-out — one reviewer per domain, in parallel. A domain
-    //    whose model call fails is dropped to zero findings; the review still
-    //    ships. Only if EVERY reviewer fails do we re-raise (the typed cause).
+    // 6. Usage metering — wrap the ModelGateway from context so every
+    //    `complete` on the fan-out ADDS its reported token usage to a Ref. This
+    //    taps the seam WITHOUT touching the shared review engine (which just sees
+    //    a normal ModelGateway); models that report no usage add zero.
+    const usageRef = yield* Ref.make<CostUsage>({ inputTokens: 0, outputTokens: 0 });
+    const baseGateway = yield* ModelGateway;
+    const metering: ModelGatewayService = {
+      complete: (req) =>
+        baseGateway.complete(req).pipe(
+          Effect.tap((res) =>
+            Ref.update(usageRef, (u) => ({
+              inputTokens: u.inputTokens + (res.inputTokens ?? 0),
+              outputTokens: u.outputTokens + (res.outputTokens ?? 0),
+            })),
+          ),
+        ),
+    };
+
+    // 7. Fault-isolated fan-out — one reviewer per domain, in parallel, each
+    //    provided the metering gateway. A domain whose model call fails is
+    //    dropped to zero findings; the review still ships. Only if EVERY reviewer
+    //    fails do we re-raise (the typed cause — rate-limited surfaces here).
     const results = yield* Effect.forEach(
       plan.agents,
       (agent) =>
@@ -234,7 +320,7 @@ const reviewBody = (input: MrReviewInput) =>
           mode: resolved.mode,
           maxTokens: resolved.maxTokens,
           systemPrompt,
-        }).pipe(Effect.either),
+        }).pipe(Effect.either, Effect.provideService(ModelGateway, metering)),
       { concurrency: plan.agents.length },
     );
     const firstLeft = results.find(Either.isLeft);
@@ -245,10 +331,18 @@ const reviewBody = (input: MrReviewInput) =>
       Either.isRight(r) ? r.right : [],
     );
 
-    // 7. Coordinate — pure deterministic dedup + counts + verdict. Rendering +
+    // 8. Coordinate — pure deterministic dedup + counts + verdict. Rendering +
     //    posting the note is the caller's concern (mrReviewCompute → mrPostNote).
     const coordinated = yield* engineCoordinate({ findings });
-    return { ...coordinated, tier: plan.tier };
+
+    // 9. Aggregate usage + resolve the model's price (operator CONFIG_KV override
+    //    over the built-in table) so the caller can render the cost footer.
+    const usage = yield* Ref.get(usageRef);
+    const pricing: ModelPricing | undefined = resolvePricing(
+      resolved.model,
+      parsePricingOverride(yield* config.get(pricingKey(resolved.model))),
+    );
+    return { output: { ...coordinated, tier: plan.tier }, usage, model: resolved.model, pricing };
   });
 
 // ---------------------------------------------------------------------------
@@ -320,10 +414,13 @@ const severityBadge = (level: Finding["level"]): string =>
 /** How many findings render in the note before the overflow line. */
 const MAX_RENDERED_FINDINGS = 25;
 
-/** Render the consolidated review as a GitLab-flavoured markdown note. */
+/** Render the consolidated review as a GitLab-flavoured markdown note. The
+ *  optional `footer` (the per-run cost line) renders just above the marker; it is
+ *  `null` when the model reported no usage (see {@link costFooter}). */
 const renderReviewComment = (
   input: Pick<MrReviewInput, "projectWebUrl" | "headSha">,
   output: typeof ReviewOutputSchema.Type,
+  footer: string | null,
 ): string => {
   const verdictBadge = Match.value(output.verdict).pipe(
     Match.when("approve", () => "✅ Approve"),
@@ -365,7 +462,13 @@ const renderReviewComment = (
             : []),
         ];
 
-  return [...header, ...findingsBlock, "", COMMENT_MARKER].join("\n");
+  return [
+    ...header,
+    ...findingsBlock,
+    "",
+    ...(footer !== null ? [footer, ""] : []),
+    COMMENT_MARKER,
+  ].join("\n");
 };
 
 // --- The defineRun value (trigger + contract metadata + registry shape) ------
