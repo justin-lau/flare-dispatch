@@ -19,6 +19,7 @@ import {
   type AgenticState,
   finalizeAgentic,
   initAgenticReview,
+  isReadOnlyRepoQuery,
   MAX_TURNS,
   runAgenticReview,
   runAgenticTurn,
@@ -343,6 +344,38 @@ describe("runAgenticTurn", () => {
     expect(next.error?.rateLimited).toBe(true);
   });
 
+  it("rejects a file-read SQL query client-side — never calls the bridge", async () => {
+    let bridgeCalled = false;
+    server.use(
+      http.post(`${ENDPOINT}/mcp`, () => {
+        bridgeCalled = true;
+        return envelope({ columns: [], rows: [] });
+      }),
+    );
+    const state = baseState({
+      turn: 1,
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: "u" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [
+            { id: "q0", name: "hakiri_query", arguments: { sql: "select read_text('/etc/hostname')" } },
+          ],
+        },
+      ],
+    });
+    const fake = makeModelGatewayFake({ responses: [submitCall([])] });
+    await runTurn(state, fake, makeConfigFake({ "pr-review.hakiri.token": "t" }));
+
+    const toolMsg = (fake.state as ModelGatewayFakeState).requests[0]?.messages?.find(
+      (m) => m.role === "tool",
+    );
+    expect(toolMsg?.content).toContain("query rejected");
+    expect(bridgeCalled).toBe(false);
+  });
+
   it("bounds the returned state: evicts the OLDEST tool results, keeps the newest + the diff/user turn", async () => {
     const BIG = "z".repeat(400_000);
     const state = baseState({
@@ -494,5 +527,54 @@ describe("finalizeAgentic", () => {
     expect(r.status).toBe("failure");
     expect(r.noteBody).toContain("boom");
     expect(r.usage).toEqual({ inputTokens: 120, outputTokens: 30 });
+  });
+});
+
+describe("isReadOnlyRepoQuery (hakiri_query SQL allowlist)", () => {
+  it("accepts a plain read-only SELECT over repo_files", () => {
+    expect(isReadOnlyRepoQuery("select content from repo_files where not deleted")).toBe(true);
+  });
+
+  it("accepts a WITH (CTE) read-only query", () => {
+    expect(
+      isReadOnlyRepoQuery(
+        "with x as (select path, content from repo_files where not deleted) select * from x limit 5",
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts a single trailing semicolon", () => {
+    expect(isReadOnlyRepoQuery("select 1 from repo_files;")).toBe(true);
+  });
+
+  it("rejects multi-statement SQL", () => {
+    expect(isReadOnlyRepoQuery("select 1; select 2")).toBe(false);
+    expect(isReadOnlyRepoQuery("select 1; drop table repo_files")).toBe(false);
+  });
+
+  it("rejects non-SELECT/WITH leading statements", () => {
+    expect(isReadOnlyRepoQuery("pragma database_list")).toBe(false);
+    expect(isReadOnlyRepoQuery("install httpfs")).toBe(false);
+    expect(isReadOnlyRepoQuery("load httpfs")).toBe(false);
+    expect(isReadOnlyRepoQuery("attach 'x.db' as y")).toBe(false);
+    expect(isReadOnlyRepoQuery("copy (select 1) to '/tmp/x'")).toBe(false);
+    expect(isReadOnlyRepoQuery("")).toBe(false);
+  });
+
+  it("rejects file-read / network / extension function primitives even inside a SELECT", () => {
+    expect(isReadOnlyRepoQuery("select read_text('/etc/hostname')")).toBe(false);
+    expect(isReadOnlyRepoQuery("select read_blob('/etc/passwd')")).toBe(false);
+    expect(isReadOnlyRepoQuery("select * from read_csv('http://evil/x.csv')")).toBe(false);
+    expect(isReadOnlyRepoQuery("select * from read_parquet('s3://x')")).toBe(false);
+    expect(isReadOnlyRepoQuery("select * from read_json('/x')")).toBe(false);
+    expect(isReadOnlyRepoQuery("select * from glob('/etc/*')")).toBe(false);
+  });
+
+  it("does not false-reject columns/strings that merely CONTAIN a forbidden token as a substring", () => {
+    // `loaded` contains `load`, `copy_count` contains `copy` — whole-word matching
+    // must let these through.
+    expect(
+      isReadOnlyRepoQuery("select copy_count from repo_files where content like '%loaded%' and not deleted"),
+    ).toBe(true);
   });
 });

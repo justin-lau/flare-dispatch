@@ -475,6 +475,36 @@ const executePendingToolCalls = (
     return { toolResults, executed };
   });
 
+/**
+ * The bridge's `context.query` runs model-authored SQL against DuckDB, whose
+ * `read_text` / `read_blob` / `COPY` / `glob` etc. are LOCAL-READ + exfil
+ * primitives — and the model can be steered by (untrusted) retrieved content. So
+ * hakiri_query SQL is allowlisted CLIENT-SIDE before it ever reaches the bridge:
+ * accept only a SINGLE read-only `SELECT`/`WITH` statement over `repo_files`, and
+ * reject anything carrying a statement separator or a file/network/extension
+ * primitive. Pure + exported for unit testing. Defense-in-depth: false rejects are
+ * the safe direction (the model self-corrects on the rejection tool result).
+ */
+const FORBIDDEN_SQL_TOKENS =
+  /\b(pragma|attach|copy|install|load|export|import|read_text|read_blob|read_csv|read_parquet|read_json|glob)\b/i;
+
+export const isReadOnlyRepoQuery = (sql: string): boolean => {
+  const trimmed = sql.trim();
+  if (trimmed === "") return false;
+  // A single statement only: strip ONE trailing ';', reject any remaining ';'.
+  const body = trimmed.replace(/;\s*$/, "");
+  if (body.includes(";")) return false;
+  // Must be a read-only projection.
+  if (!/^(select|with)\b/i.test(body)) return false;
+  // No file-read / network / extension primitives (whole-word, case-insensitive).
+  if (FORBIDDEN_SQL_TOKENS.test(body)) return false;
+  return true;
+};
+
+/** The tool result returned (WITHOUT calling the bridge) for a rejected query. */
+const SQL_REJECTED =
+  "query rejected: only read-only SELECT/WITH over repo_files is allowed (no file/network functions)";
+
 /** Execute ONE retrieval call — never throws (any failure → an error string). */
 const runOneRetrieval = async (
   call: (name: string, argument: Record<string, unknown>) => Promise<unknown>,
@@ -487,6 +517,8 @@ const runOneRetrieval = async (
       return toolText(await call("context.search", { query, limit: SEARCH_LIMIT })) || "(no results)";
     }
     const sql = String(args.sql ?? "");
+    // Client-side allowlist BEFORE the bridge sees the SQL.
+    if (!isReadOnlyRepoQuery(sql)) return SQL_REJECTED;
     return toolText(await call("context.query", { sql })) || "(no rows)";
   } catch (e) {
     return `error: hakiri call failed — ${e instanceof Error ? e.message : String(e)}`;
