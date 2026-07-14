@@ -130,6 +130,23 @@ wrangler deploy --config $CFG
   a failure note — it logs a warning and records status `skipped-quota` in the D1
   row (the `post-review` step posts nothing on a null body). Non-rate-limit
   failures keep the visible "could not complete" note.
+- **Retrieval grounding (A/B, CONFIG_KV-gated, OFF by default).** With
+  `pr-review.hakiri.endpoint` set (a full https URL to a hakiri MCP tunnel; opt.
+  `pr-review.hakiri.token`), `mr-review` queries a whole-codebase context store
+  BEFORE the model call and PREPENDS surrounding code to the diff as a delimited
+  grounding block — the pre-change contents of the changed files
+  (`context.query select … from repo_files where path in (…)`) plus keyword hits
+  (`context.search`, queries derived from the diff's changed paths + added
+  imports/calls). Best-effort: any HTTP/parse error → diff-only. The real diff is
+  passed through INTACT (the context is additional headroom, capped ~12k chars;
+  the risk-tier heuristic sees the real diff). `runs/mr-review-grounding.ts` holds
+  the pure core + the MCP client; the run persists `grounded: true|false` into the
+  D1 `summary_json`. Endpoint unset → byte-identical to pre-grounding behaviour,
+  so the A/B is one config flip. **Live-schema caveats to confirm against the
+  deployed tunnel:** the file-content table may be `workspace_files` not
+  `repo_files` (a wrong name silently drops file-content grounding — search still
+  works), and the streamable-HTTP MCP transport may need an `initialize`
+  handshake / `text/event-stream` accept the plain-POST client doesn't do.
 
 ## Phased upstream outline
 
