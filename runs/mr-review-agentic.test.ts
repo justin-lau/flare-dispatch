@@ -8,7 +8,7 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { Effect, Layer } from "effect";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { ModelGateway, ModelGatewayError } from "@flare-dispatch/core";
+import { Config, ModelGateway, ModelGatewayError } from "@flare-dispatch/core";
 import {
   makeConfigFake,
   makeModelGatewayFake,
@@ -74,8 +74,12 @@ const baseState = (o: Partial<AgenticState> = {}): AgenticState => ({
 const runTurn = (
   state: AgenticState,
   fake: { layer: Layer.Layer<ModelGateway> },
+  // A turn re-reads the hakiri token from Config — provide a fake (default empty).
+  config: Layer.Layer<Config> = makeConfigFake({}),
 ): Promise<AgenticState> =>
-  Effect.runPromise(runAgenticTurn(state).pipe(Effect.provide(fake.layer)));
+  Effect.runPromise(
+    runAgenticTurn(state).pipe(Effect.provide(Layer.mergeAll(fake.layer, config))),
+  );
 
 // A scripted model response calling hakiri_search / submit_review.
 const searchCall = (query: string, usage?: { inputTokens: number; outputTokens: number }) => ({
@@ -116,10 +120,51 @@ describe("initAgenticReview", () => {
     expect(state.messages[1]?.content).toContain(SAMPLE_DIFF);
     expect(state.done).toBe(false);
     expect(state.turn).toBe(0);
-    expect(state.retrieval).toEqual({ endpoint: ENDPOINT, token: "secret" });
+    // ONLY the endpoint is carried — the bearer token must never enter the state.
+    expect(state.retrieval).toEqual({ endpoint: ENDPOINT });
     expect(state.model).toBe("openrouter/deepseek/deepseek-v4-pro");
     // fetchDiff was called with the MR ref.
     expect(scm.state.fetchDiffCalls[0]).toMatchObject({ project: "1", number: 2 });
+  });
+
+  it("never persists the hakiri bearer token in the serialized state (init or turn returns)", async () => {
+    const TOKEN = "super-secret-bearer-xyz";
+    const config = makeConfigFake({
+      "pr-review.backend": "openrouter",
+      "pr-review.openrouter.model": "openrouter/m",
+      "pr-review.hakiri.endpoint": ENDPOINT,
+      "pr-review.hakiri.token": TOKEN,
+    });
+    const scm = makeScmFake({ diff: SAMPLE_DIFF });
+
+    // init state carries no token.
+    const initState = await Effect.runPromise(
+      initAgenticReview(INPUT).pipe(Effect.provide(Layer.mergeAll(config, scm.layer))),
+    );
+    expect(JSON.stringify(initState)).not.toContain(TOKEN);
+
+    // A turn that actually reaches hakiri (with the token in Config) still returns
+    // state with no token — even though it USED the token to authenticate.
+    let seenAuth = "";
+    server.use(
+      http.post(`${ENDPOINT}/mcp`, ({ request }) => {
+        seenAuth = request.headers.get("authorization") ?? "";
+        return envelope({ columns: ["path", "snippet"], rows: [["a", "b"]] });
+      }),
+    );
+    const withPendingCall: AgenticState = {
+      ...initState,
+      messages: [
+        ...initState.messages,
+        { role: "assistant", content: "", toolCalls: [{ id: "c0", name: "hakiri_search", arguments: { query: "q" } }] },
+      ],
+    };
+    const fake = makeModelGatewayFake({ responses: [submitCall([])] });
+    const turnState = await runTurn(withPendingCall, fake, config);
+
+    // The token WAS used (auth header sent) but is absent from the returned state.
+    expect(seenAuth).toBe(`Bearer ${TOKEN}`);
+    expect(JSON.stringify(turnState)).not.toContain(TOKEN);
   });
 
   it("leaves retrieval undefined when no hakiri endpoint is configured", async () => {
@@ -133,6 +178,28 @@ describe("initAgenticReview", () => {
     );
     expect(state.retrieval).toBeUndefined();
     expect(state.done).toBe(false);
+  });
+
+  it("clamps the agentic diff below the backend cap (Workflow step-return budget)", async () => {
+    // openrouter's backend cap is 240k; the agentic ceiling is 150k. A 240k diff
+    // must be clamped so the diff — re-returned by every durable turn step — stays
+    // under the ~1 MiB step-return budget.
+    const bigDiff =
+      "diff --git a/big.ts b/big.ts\n--- a/big.ts\n+++ b/big.ts\n@@ -1 +1 @@\n" +
+      "+// padding line\n".repeat(16_000);
+    const config = makeConfigFake({
+      "pr-review.backend": "openrouter",
+      "pr-review.openrouter.model": "openrouter/m",
+    });
+    const scm = makeScmFake({ diff: bigDiff });
+    const state = await Effect.runPromise(
+      initAgenticReview(INPUT).pipe(Effect.provide(Layer.mergeAll(config, scm.layer))),
+    );
+    expect(bigDiff.length).toBeGreaterThan(200_000);
+    // The user turn carries the diff — clamped near 150k, well under the raw length.
+    const userContent = state.messages[1]?.content ?? "";
+    expect(userContent.length).toBeLessThanOrEqual(155_000);
+    expect(userContent.length).toBeGreaterThan(120_000);
   });
 
   it("records a terminal error when the backend is unconfigured (never throws)", async () => {
@@ -275,6 +342,30 @@ describe("runAgenticTurn", () => {
     expect(next.done).toBe(true);
     expect(next.error?.rateLimited).toBe(true);
   });
+
+  it("bounds the returned state: evicts the OLDEST tool results, keeps the newest + the diff/user turn", async () => {
+    const BIG = "z".repeat(400_000);
+    const state = baseState({
+      retrieval: undefined, // only submit_review offered; last msg is a tool result → no pending exec
+      turn: 2,
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: "THE-DIFF" },
+        { role: "assistant", content: "", toolCalls: [{ id: "a0", name: "hakiri_search", arguments: {} }] },
+        { role: "tool", content: BIG, toolCallId: "a0", name: "hakiri_search" }, // OLD → evictable
+        { role: "assistant", content: "", toolCalls: [{ id: "a1", name: "hakiri_search", arguments: {} }] },
+        { role: "tool", content: BIG, toolCallId: "a1", name: "hakiri_search" }, // NEWEST → protected
+      ],
+    });
+    const fake = makeModelGatewayFake({ responses: [submitCall([])] });
+
+    const next = await runTurn(state, fake);
+    const msgs = next.messages;
+    expect(msgs[3]?.content).toBe("[tool result dropped to bound workflow state size]");
+    expect(msgs[5]?.content).toBe(BIG); // newest turn's result preserved
+    expect(msgs[1]?.content).toBe("THE-DIFF"); // diff/user turn never touched
+    expect(JSON.stringify(next.messages).length).toBeLessThanOrEqual(700_000);
+  });
 });
 
 describe("runAgenticReview (full loop)", () => {
@@ -379,18 +470,29 @@ describe("finalizeAgentic", () => {
     expect(r.grounded).toBe(false);
   });
 
-  it("degrades to skipped-quota on a rate-limited error (posts nothing)", () => {
-    const state = baseState({ done: true, error: { rateLimited: true, message: "rate" } });
+  it("degrades to skipped-quota (posts nothing) but STILL reports the tokens earlier turns billed", () => {
+    const state = baseState({
+      done: true,
+      cost: { inputTokens: 300, outputTokens: 60 },
+      error: { rateLimited: true, message: "rate" },
+    });
     const r = finalizeAgentic(INPUT, state);
     expect(r.status).toBe("skipped-quota");
     expect(r.noteBody).toBeNull();
     expect(r.output).toBeNull();
+    // Real spend on the completed turns is preserved for the D1 row.
+    expect(r.usage).toEqual({ inputTokens: 300, outputTokens: 60 });
   });
 
-  it("renders a failure note on a non-rate error", () => {
-    const state = baseState({ done: true, error: { rateLimited: false, message: "boom" } });
+  it("renders a failure note on a non-rate error and reports the billed tokens", () => {
+    const state = baseState({
+      done: true,
+      cost: { inputTokens: 120, outputTokens: 30 },
+      error: { rateLimited: false, message: "boom" },
+    });
     const r = finalizeAgentic(INPUT, state);
     expect(r.status).toBe("failure");
     expect(r.noteBody).toContain("boom");
+    expect(r.usage).toEqual({ inputTokens: 120, outputTokens: 30 });
   });
 });

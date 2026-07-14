@@ -13,6 +13,10 @@ import type { MrComputeResult } from "@flare-dispatch/runs/mr-review";
 /** The `<!-- flare-dispatch: mr-review -->` marker — kept in one place. */
 const MR_REVIEW_MARKER = "<!-- flare-dispatch: mr-review -->";
 
+/** Whether a usage figure reflects tokens actually billed (non-null, non-zero). */
+const hasSpend = (usage: MrComputeResult["usage"]): boolean =>
+  usage !== null && (usage.inputTokens > 0 || usage.outputTokens > 0);
+
 /** What the review step yields for `finalize` + the `post-review` step. */
 export type ReviewOutcome = {
   /** Terminal `executions.status`. `skipped-quota` = model quota exhausted, no
@@ -40,11 +44,16 @@ export const reviewOutcome = (
       status: r.status,
       // Persist the review output, the aggregated token usage, AND whether the
       // run was retrieval-grounded (the A/B arm) so the D1 row carries the
-      // per-run cost inputs and the grounded/diff-only label.
+      // per-run cost inputs and the grounded/diff-only label. On a degraded run
+      // (no verdict — failure / skipped-quota) there is no output, but the agentic
+      // path may still have BILLED tokens on earlier turns: record a usage-only
+      // summary so the D1 row reflects real spend rather than reporting nothing.
       summaryJson:
         r.output !== null
           ? JSON.stringify({ ...r.output, usage: r.usage, grounded: r.grounded })
-          : null,
+          : hasSpend(r.usage)
+            ? JSON.stringify({ usage: r.usage })
+            : null,
       noteBody: r.noteBody,
     }),
     onFailure: (cause) => {

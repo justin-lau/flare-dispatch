@@ -143,10 +143,13 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
       );
       // Deterministic step names — a replay memoizes completed turns; the loop
       // breaks on `state.done`, so the executed step sequence replays identically.
+      // Each turn needs Config too — the hakiri bearer token is re-read from CONFIG_KV
+      // inside the turn (never persisted in the durable step state).
+      const turnLayer = Layer.mergeAll(modelLayer, configLayer);
       for (let i = 0; i < MAX_TURNS; i++) {
         if (state.done) break;
         state = await stepDo(`agentic-turn-${i + 1}`, async () =>
-          Effect.runPromise(runAgenticTurn(state).pipe(Effect.provide(modelLayer))),
+          Effect.runPromise(runAgenticTurn(state).pipe(Effect.provide(turnLayer))),
         );
       }
       // `finalizeAgentic` is pure — no step needed; wrap in a success Exit so the

@@ -63,6 +63,33 @@ describe("reviewOutcome", () => {
     expect(out.noteBody).toBeNull();
   });
 
+  it("degraded run (output null) WITH billed tokens → summaryJson carries a usage-only summary", () => {
+    // A mid-run rate-limit / failure in the agentic path may have billed tokens on
+    // earlier turns — the D1 row must record real spend, not report nothing.
+    const compute: MrComputeResult = {
+      status: "skipped-quota",
+      output: null,
+      usage: { inputTokens: 300, outputTokens: 60 },
+      grounded: false,
+      noteBody: null,
+    };
+    const out = reviewOutcome(Exit.succeed(compute));
+    expect(out.status).toBe("skipped-quota");
+    expect(out.noteBody).toBeNull();
+    expect(JSON.parse(out.summaryJson!)).toEqual({ usage: { inputTokens: 300, outputTokens: 60 } });
+  });
+
+  it("degraded run (output null) with ZERO usage → summaryJson stays null (no noise)", () => {
+    const compute: MrComputeResult = {
+      status: "failure",
+      output: null,
+      usage: { inputTokens: 0, outputTokens: 0 },
+      grounded: false,
+      noteBody: "could not complete",
+    };
+    expect(reviewOutcome(Exit.succeed(compute)).summaryJson).toBeNull();
+  });
+
   it("a DEFECT is logged (Cause.pretty) and yields a crash note", () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     const out = reviewOutcome(Exit.failCause(Cause.die(new Error("boom"))) as Exit.Exit<MrComputeResult, never>);

@@ -90,6 +90,25 @@ const TOOL_CALLS_PER_TURN = 4;
 const TOOL_RESULT_MAX_CHARS = 12_000;
 /** `context.search` hits per hakiri_search call. */
 const SEARCH_LIMIT = 3;
+/**
+ * Agentic diff ceiling. The capped diff lives inside `messages` and is RE-RETURNED
+ * by every turn step, and a Cloudflare Workflow durably persists each step's
+ * return under a ~1 MiB budget — so the diff carried across turns is clamped to
+ * `min(backend maxDiffChars, this)`, well under that budget (leaving room for the
+ * accumulating tool-result transcript). A larger backend context window still
+ * applies to single-shot; agentic trades a little diff coverage for durable state.
+ */
+const AGENTIC_MAX_DIFF_CHARS = 150_000;
+/**
+ * Soft ceiling on the serialized `messages` a turn returns — a guard against the
+ * transcript (diff + up to {@link MAX_TURNS}×{@link TOOL_CALLS_PER_TURN} tool
+ * results) approaching the Workflow's ~1 MiB step-return limit. Over budget, the
+ * OLDEST tool-role results are dropped to a marker (never the diff/user turn, never
+ * the newest turn's results). ~700k chars leaves headroom for JSON overhead.
+ */
+const STATE_MESSAGES_BUDGET = 700_000;
+/** The marker an evicted tool result is replaced with (the model sees it honestly). */
+const DROPPED_TOOL_RESULT = "[tool result dropped to bound workflow state size]";
 
 // ---------------------------------------------------------------------------
 // Tools offered to the model.
@@ -189,8 +208,13 @@ export type AgenticState = {
   readonly maxTokens: number;
   /** The risk tier (pure heuristic on the diff) — stitched onto the output. */
   readonly tier: Tier;
-  /** Resolved hakiri retrieval config — `undefined` disables the retrieval tools. */
-  readonly retrieval?: GroundingConfig;
+  /**
+   * Resolved hakiri retrieval ENDPOINT — `undefined` disables the retrieval tools.
+   * The bearer TOKEN is deliberately NOT stored here: this state is a durable
+   * Workflow step return, so a token would be persisted to workflow storage. The
+   * token is re-read from Config inside each turn instead (see {@link runAgenticTurn}).
+   */
+  readonly retrieval?: { readonly endpoint: string };
   /** Resolved price (operator override over the table) — for the cost footer. */
   readonly pricing?: ModelPricing;
   /** Cumulative retrieval tool calls actually executed (for the footer + grounded flag). */
@@ -214,7 +238,12 @@ export const initAgenticReview = (
     const resolved = yield* resolveBackend((key) => config.get(key), { namespace: NS });
 
     const rawDiff = yield* scm.fetchDiff(refFor(input));
-    const diff = capDiff(stripDiffNoise(rawDiff), resolved.maxDiffChars);
+    // Clamp below the backend cap so the diff — re-returned in `messages` by every
+    // durable turn step — stays under the Workflow's ~1 MiB step-return budget.
+    const diff = capDiff(
+      stripDiffNoise(rawDiff),
+      Math.min(resolved.maxDiffChars, AGENTIC_MAX_DIFF_CHARS),
+    );
     const tier = yield* riskTier({ diff });
 
     const guidelines = (yield* config.get(guidelinesKey(NS)))?.trim();
@@ -268,14 +297,22 @@ const errorState = (message: string): AgenticState => ({
   toolCallCount: 0,
 });
 
-/** Resolve hakiri retrieval config from CONFIG_KV — `undefined` (no endpoint) →
- *  agentic runs with only `submit_review` offered (no retrieval tools). */
-const resolveRetrieval = (): Effect.Effect<GroundingConfig | undefined, never, Config> =>
+/** Resolve the hakiri retrieval ENDPOINT from CONFIG_KV — `undefined` (no endpoint)
+ *  → agentic runs with only `submit_review` offered (no retrieval tools). The token
+ *  is intentionally NOT read here (it must not enter the durable state) — see
+ *  {@link readRetrievalToken}, called fresh inside each turn. */
+const resolveRetrieval = (): Effect.Effect<{ endpoint: string } | undefined, never, Config> =>
   Effect.gen(function* () {
     const endpoint = (yield* config.get("pr-review.hakiri.endpoint"))?.trim();
-    if (endpoint === undefined || endpoint === "") return undefined;
+    return endpoint === undefined || endpoint === "" ? undefined : { endpoint };
+  });
+
+/** Re-read the hakiri bearer token from Config — called INSIDE a turn (never stored
+ *  in the serialized state). `undefined` when unset/blank. */
+const readRetrievalToken = (): Effect.Effect<string | undefined, never, Config> =>
+  Effect.gen(function* () {
     const token = (yield* config.get("pr-review.hakiri.token"))?.trim();
-    return { endpoint, ...(token !== undefined && token !== "" ? { token } : {}) };
+    return token === undefined || token === "" ? undefined : token;
   });
 
 // ---------------------------------------------------------------------------
@@ -291,11 +328,13 @@ const resolveRetrieval = (): Effect.Effect<GroundingConfig | undefined, never, C
  */
 export const runAgenticTurn = (
   state: AgenticState,
-): Effect.Effect<AgenticState, never, ModelGateway> =>
+): Effect.Effect<AgenticState, never, ModelGateway | Config> =>
   Effect.gen(function* () {
     if (state.done) return state;
 
     // (i) Execute pending retrieval tool calls from the previous assistant turn.
+    // The bearer token is re-read from Config HERE (never carried in the durable
+    // state) and combined with the endpoint into a per-turn retrieval config.
     const last = state.messages[state.messages.length - 1];
     let messages: ReadonlyArray<ModelMessage> = state.messages;
     let toolCallCount = state.toolCallCount;
@@ -305,9 +344,14 @@ export const runAgenticTurn = (
       last.toolCalls !== undefined &&
       last.toolCalls.length > 0
     ) {
+      let retrievalConfig: GroundingConfig | undefined;
+      if (state.retrieval !== undefined) {
+        const token = yield* readRetrievalToken();
+        retrievalConfig = { endpoint: state.retrieval.endpoint, ...(token !== undefined ? { token } : {}) };
+      }
       const { toolResults, executed } = yield* executePendingToolCalls(
         last.toolCalls,
-        state.retrieval,
+        retrievalConfig,
       );
       messages = [...messages, ...toolResults];
       toolCallCount += executed;
@@ -334,7 +378,7 @@ export const runAgenticTurn = (
       const e = result.left;
       return {
         ...state,
-        messages,
+        messages: boundStateSize(messages),
         toolCallCount,
         turn: state.turn + 1,
         done: true,
@@ -359,7 +403,8 @@ export const runAgenticTurn = (
     };
     const next: AgenticState = {
       ...state,
-      messages: [...messages, assistantMessage],
+      // Bound the serialized transcript before it becomes a durable step return.
+      messages: boundStateSize([...messages, assistantMessage]),
       cost: accumulateCost(state.cost, res),
       toolCallCount,
       turn: state.turn + 1,
@@ -462,15 +507,19 @@ export const finalizeAgentic = (
   input: MrReviewInput,
   state: AgenticState,
 ): MrComputeResult => {
+  // Degradation still posts no note, BUT carries the usage EARLIER turns actually
+  // billed — a mid-run rate-limit / failure spent real tokens, and the D1 row must
+  // record them rather than reporting zero cost (see reviewOutcome, which persists
+  // a usage-only summary when there is no verdict).
   if (state.error?.rateLimited === true) {
-    return { status: "skipped-quota", output: null, noteBody: null, usage: null, grounded: false };
+    return { status: "skipped-quota", output: null, noteBody: null, usage: state.cost, grounded: false };
   }
   if (state.error !== undefined) {
     return {
       status: "failure",
       output: null,
       noteBody: failureNote(state.error.message),
-      usage: null,
+      usage: state.cost,
       grounded: false,
     };
   }
@@ -479,7 +528,7 @@ export const finalizeAgentic = (
       status: "failure",
       output: null,
       noteBody: failureNote(`agentic review did not submit a verdict within ${MAX_TURNS} turns`),
-      usage: null,
+      usage: state.cost,
       grounded: false,
     };
   }
@@ -541,6 +590,34 @@ const safeJson = (s: string): unknown => {
 /** Truncate an over-long tool result with a visible marker. */
 const truncate = (s: string): string =>
   s.length > TOOL_RESULT_MAX_CHARS ? `${s.slice(0, TOOL_RESULT_MAX_CHARS)}\n[truncated]` : s;
+
+/**
+ * Bound the serialized `messages` under {@link STATE_MESSAGES_BUDGET} before they
+ * become a durable Workflow step return. Over budget, the OLDEST tool-role results
+ * are replaced with a marker until under budget — NEVER the diff/user turn, and
+ * NEVER the newest turn's tool results (those after the second-to-last assistant
+ * message, which the model just consumed). Assistant text is left intact. Pure.
+ */
+const boundStateSize = (
+  messages: ReadonlyArray<ModelMessage>,
+): ReadonlyArray<ModelMessage> => {
+  if (JSON.stringify(messages).length <= STATE_MESSAGES_BUDGET) return messages;
+
+  // Protect the newest turn's tool results: those AFTER the second-to-last
+  // assistant message. Older tool results (index ≤ that assistant) are evictable.
+  const assistantIdxs = messages.flatMap((m, i) => (m.role === "assistant" ? [i] : []));
+  const protectFrom = assistantIdxs.length >= 2 ? assistantIdxs[assistantIdxs.length - 2]! : -1;
+
+  const out = messages.map((m) => ({ ...m }));
+  for (let i = 0; i <= protectFrom; i++) {
+    if (JSON.stringify(out).length <= STATE_MESSAGES_BUDGET) break;
+    const m = out[i]!;
+    if (m.role === "tool" && m.content !== DROPPED_TOOL_RESULT) {
+      out[i] = { ...m, content: DROPPED_TOOL_RESULT };
+    }
+  }
+  return out;
+};
 
 /** Parse a `submit_review` tool call's arguments to findings, or `none`. */
 const parseFindings = (args: unknown): Option.Option<ReadonlyArray<Finding>> => {
