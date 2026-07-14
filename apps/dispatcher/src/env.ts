@@ -388,6 +388,15 @@ export interface Env {
   readonly AI_GATEWAY_ID?: string;
 
   /**
+   * Optional OpenRouter API key — a SECRET. Backs the `modelGateway`'s
+   * `openrouter/*` route (a frontier reasoning model like DeepSeek v4 Pro for
+   * the review A/B), called directly with `Authorization: Bearer` (NOT via the
+   * AI Gateway). Absent → the `openrouter/*` route fails `auth-failed`; other
+   * backends unaffected. `wrangler secret put OPENROUTER_API_KEY`.
+   */
+  readonly OPENROUTER_API_KEY?: string;
+
+  /**
    * Admission-semaphore slots per container pool (issue #109) — a var, not a
    * secret, carried as a string like every wrangler var. At most this many
    * runs are in flight per pool (lean / browser); the rest queue FIFO in D1.

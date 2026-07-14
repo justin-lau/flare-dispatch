@@ -103,6 +103,13 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
               this.env.AI_GATEWAY_ID !== undefined && this.env.AI_GATEWAY_ID.length > 0
                 ? this.env.AI_GATEWAY_ID
                 : undefined,
+              // cloudflareAccountId / gatewayAuthToken / usageSink are unused in
+              // the PoC (no Bedrock, no D1 metering sink) — pass through to the
+              // OPENROUTER_API_KEY slot so the `openrouter/*` A/B backend works.
+              undefined,
+              undefined,
+              undefined,
+              this.env.OPENROUTER_API_KEY,
             );
       const configLayer =
         this.env.CONFIG_KV === undefined
