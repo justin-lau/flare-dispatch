@@ -332,10 +332,19 @@ const reviewBody = (input: MrReviewInput) =>
       complete: (req) =>
         baseGateway.complete(req).pipe(
           Effect.tap((res) =>
-            Ref.update(usageRef, (u) => ({
-              inputTokens: u.inputTokens + (res.inputTokens ?? 0),
-              outputTokens: u.outputTokens + (res.outputTokens ?? 0),
-            })),
+            Ref.update(usageRef, (u) => {
+              // Sum provider cost + reasoning tokens across the fan-out, keeping
+              // them undefined unless SOME call reported them (so the footer
+              // falls back to the pricing table when no provider cost exists).
+              const costUsd = addOptional(u.costUsd, res.costUsd);
+              const reasoningTokens = addOptional(u.reasoningTokens, res.reasoningTokens);
+              return {
+                inputTokens: u.inputTokens + (res.inputTokens ?? 0),
+                outputTokens: u.outputTokens + (res.outputTokens ?? 0),
+                ...(costUsd !== undefined ? { costUsd } : {}),
+                ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+              };
+            }),
           ),
         ),
     };
@@ -406,6 +415,10 @@ const resolveGrounding = (
 
 // ---------------------------------------------------------------------------
 // Helpers.
+
+/** Sum two optional numbers, staying `undefined` only when BOTH are absent. */
+const addOptional = (a: number | undefined, b: number | undefined): number | undefined =>
+  a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
 
 const refFor = (input: MrReviewInput): ChangeRef => ({
   project: input.projectId,

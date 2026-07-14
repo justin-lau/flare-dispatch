@@ -22,6 +22,14 @@ export type ModelPricing = readonly [inputPerM: number, outputPerM: number];
 export type CostUsage = {
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /**
+   * Provider-reported EXACT charge in USD, summed across the fan-out — present
+   * only when the backend returns a cost (OpenRouter usage accounting). When
+   * set, the footer shows this real charge instead of the per-M-token estimate.
+   */
+  readonly costUsd?: number;
+  /** Reasoning/thinking tokens spent, summed — present only when reported. */
+  readonly reasoningTokens?: number;
 };
 
 /**
@@ -38,6 +46,9 @@ export const DEFAULT_PRICING: Readonly<Record<string, ModelPricing>> = {
   // @cloudflare/workers-types AI catalog).
   "@cf/openai/gpt-oss-120b": [0.35, 0.75],
   "@cf/openai/gpt-oss-20b": [0.2, 0.3],
+  // OpenRouter frontier reasoning model — FALLBACK only: OpenRouter returns an
+  // exact `usage.cost` the footer prefers, this per-M estimate is used if it's absent.
+  "openrouter/deepseek/deepseek-v4-pro": [0.435, 0.87],
 };
 
 /** USD per neuron — Workers AI bills $0.011 per 1,000 neurons. */
@@ -81,13 +92,16 @@ export const costOf = (
 const grouped = (n: number): string => Math.round(n).toLocaleString("en-US");
 
 /**
- * Render the per-run cost footer line — or `null` to omit it entirely. Shape:
+ * Render the per-run cost footer line — or `null` to omit it entirely. Shapes:
  *
- *   ⚙️ @cf/qwen/qwen2.5-coder-32b-instruct · 14,230 in + 1,872 out tokens · ~1,024 neurons · ≈$0.0113
+ *   Workers AI (estimated from the per-M table, in CF neurons):
+ *     ⚙️ @cf/qwen/qwen2.5-coder-32b-instruct · 14,230 in + 1,872 out tokens · ~1,024 neurons · ≈$0.0113
+ *   OpenRouter (provider-reported EXACT cost — no neurons; reasoning noted when present):
+ *     ⚙️ openrouter/deepseek/deepseek-v4-pro · 9,000 in + 1,200 out tokens · +512 reasoning · ≈$0.0053
  *
  * Degradation:
  *   * no usage at all (both counts ≤ 0) → `null` (no footer — never guess).
- *   * usage but no known price          → token counts only (no USD/neurons).
+ *   * usage but no price AND no provider cost → token counts only.
  */
 export const costFooter = (args: {
   readonly model: string;
@@ -97,9 +111,19 @@ export const costFooter = (args: {
   const { model, usage, pricing } = args;
   if (usage.inputTokens <= 0 && usage.outputTokens <= 0) return null;
 
-  const tokens = `${grouped(usage.inputTokens)} in + ${grouped(usage.outputTokens)} out tokens`;
-  if (pricing === undefined) return `⚙️ ${model} · ${tokens}`;
+  const segments = [model, `${grouped(usage.inputTokens)} in + ${grouped(usage.outputTokens)} out tokens`];
+  if (usage.reasoningTokens !== undefined && usage.reasoningTokens > 0) {
+    segments.push(`+${grouped(usage.reasoningTokens)} reasoning`);
+  }
 
-  const { usd, neurons } = costOf(usage, pricing);
-  return `⚙️ ${model} · ${tokens} · ~${grouped(neurons)} neurons · ≈$${usd.toFixed(4)}`;
+  if (usage.costUsd !== undefined) {
+    // Provider-reported exact charge wins — a real dollar figure, not a CF
+    // neuron estimate (neurons are meaningless for a non-Workers-AI backend).
+    segments.push(`≈$${usage.costUsd.toFixed(4)}`);
+  } else if (pricing !== undefined) {
+    const { usd, neurons } = costOf(usage, pricing);
+    segments.push(`~${grouped(neurons)} neurons`, `≈$${usd.toFixed(4)}`);
+  }
+
+  return `⚙️ ${segments.join(" · ")}`;
 };

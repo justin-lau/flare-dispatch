@@ -44,6 +44,9 @@ describe("resolvePricing", () => {
     expect(resolvePricing("@cf/openai/gpt-oss-120b", undefined)).toEqual([0.35, 0.75]);
     expect(resolvePricing("@cf/openai/gpt-oss-20b", undefined)).toEqual([0.2, 0.3]);
   });
+  it("carries the openrouter deepseek-v4-pro fallback estimate", () => {
+    expect(resolvePricing("openrouter/deepseek/deepseek-v4-pro", undefined)).toEqual([0.435, 0.87]);
+  });
 });
 
 describe("costOf", () => {
@@ -88,5 +91,28 @@ describe("costFooter", () => {
     expect(
       costFooter({ model: "@cf/any/model", usage: { inputTokens: 0, outputTokens: 0 }, pricing: [1, 1] }),
     ).toBeNull();
+  });
+
+  it("provider-reported cost WINS over the pricing table — real $, no CF neurons", () => {
+    expect(
+      costFooter({
+        model: "openrouter/deepseek/deepseek-v4-pro",
+        usage: { inputTokens: 9000, outputTokens: 1200, costUsd: 0.00533, reasoningTokens: 512 },
+        // even with a table price present, the exact provider cost is used
+        pricing: [0.435, 0.87],
+      }),
+    ).toBe(
+      "⚙️ openrouter/deepseek/deepseek-v4-pro · 9,000 in + 1,200 out tokens · +512 reasoning · ≈$0.0053",
+    );
+  });
+
+  it("provider cost with no reasoning tokens → omits the reasoning segment", () => {
+    expect(
+      costFooter({
+        model: "openrouter/x",
+        usage: { inputTokens: 100, outputTokens: 50, costUsd: 0.0002 },
+        pricing: undefined,
+      }),
+    ).toBe("⚙️ openrouter/x · 100 in + 50 out tokens · ≈$0.0002");
   });
 });
