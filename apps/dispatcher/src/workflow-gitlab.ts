@@ -3,15 +3,19 @@
 // A deliberately SLIM Workflow — the `RunWorkflow` (workflow.ts) machinery
 // (admission gates, container leases, check-runs, sandbox, writeback, notify)
 // is all GitHub/container-shaped and NONE of it applies to a Worker-only GitLab
-// review. Three durable steps:
+// review. Durable steps:
 //
 //   1. insert-execution — a minimal `executions` D1 row (status running).
-//   2. review           — build the 3-Layer stack (modelGateway + config + the
-//                         GitLab `scm`) and run `mrReviewCompute` (fetch + model
-//                         fan-out + render — but NOT post). Yields the verdict +
-//                         the rendered note body.
+//   2. select-mode      — read `pr-review.mode` from CONFIG_KV (memoized) →
+//                         "agentic" or single-shot.
+//   2a. single-shot: review — build the 3-Layer stack (modelGateway + config +
+//                         the GitLab `scm`) and run `mrReviewCompute` (fetch +
+//                         model fan-out + render — but NOT post).
+//   2b. agentic: agentic-init + agentic-turn-N — the multi-turn tool loop, ONE
+//                         durable step per model turn so a transient failure at
+//                         turn 6 never re-bills turns 1–5.
 //   3. post-review      — post the note (its OWN step, so a mid-flight replay
-//                         re-runs neither the model fan-out NOR the post twice).
+//                         re-runs neither the model calls NOR the post twice).
 //   4. finalize         — update the row's terminal status + summary.
 //
 // Each step is idempotent: a Workflow resume replays the memoized result rather
@@ -20,7 +24,7 @@
 
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { Effect, Layer } from "effect";
+import { Effect, Exit, Layer } from "effect";
 import {
   ConfigDeferred,
   makeConfigKvLive,
@@ -33,7 +37,14 @@ import {
   mrReviewCompute,
   type MrReviewInput,
 } from "@flare-dispatch/runs/mr-review";
-import { reviewOutcome } from "./gitlab-review-outcome";
+import {
+  type AgenticState,
+  finalizeAgentic,
+  initAgenticReview,
+  MAX_TURNS,
+  runAgenticTurn,
+} from "@flare-dispatch/runs/mr-review-agentic";
+import { reviewOutcome, type ReviewOutcome } from "./gitlab-review-outcome";
 import type { Env } from "./env";
 
 /** The Workflow params the GitLab webhook route creates each instance with. */
@@ -89,12 +100,24 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
       this.env.GITLAB_TOKEN !== undefined ? { token: this.env.GITLAB_TOKEN } : {},
     );
 
-    // 2. The review COMPUTE (no post). Build the 3-Layer stack, each Layer
-    //    degrading when its binding/secret is absent (config dies on read, model
-    //    fails typed, scm fails auth-failed) — `mrReviewCompute` catches those
-    //    into a failure note and never itself fails. `reviewOutcome` maps the
-    //    Exit to the row fields + note body, logging the Cause on any defect.
-    const outcome = await stepDo("review", async () => {
+    // 2. Review mode — `pr-review.mode` in CONFIG_KV selects the reviewer:
+    //    "agentic" drives the multi-turn tool loop step-per-turn; anything else
+    //    (the default) is the single-shot reviewer. Read in its OWN step so a
+    //    replay memoizes it — a mode flip mid-flight must not change which
+    //    branch (and therefore which step names) the replay takes.
+    const { mode } = await stepDo("select-mode", async () => {
+      const raw =
+        this.env.CONFIG_KV === undefined
+          ? null
+          : await this.env.CONFIG_KV.get("pr-review.mode");
+      return { mode: raw === "agentic" ? "agentic" : "single-shot" };
+    });
+
+    let outcome: ReviewOutcome;
+    if (mode === "agentic") {
+      // The AGENTIC path — init once, then one durable step per model turn (a
+      // transient failure at turn 6 must not re-bill turns 1–5), then map the
+      // final serializable state onto the same review-outcome shape.
       const modelLayer =
         this.env.AI === undefined
           ? ModelGatewayDeferred
@@ -103,9 +126,6 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
               this.env.AI_GATEWAY_ID !== undefined && this.env.AI_GATEWAY_ID.length > 0
                 ? this.env.AI_GATEWAY_ID
                 : undefined,
-              // cloudflareAccountId / gatewayAuthToken / usageSink are unused in
-              // the PoC (no Bedrock, no D1 metering sink) — pass through to the
-              // OPENROUTER_API_KEY slot so the `openrouter/*` A/B backend works.
               undefined,
               undefined,
               undefined,
@@ -115,13 +135,58 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
         this.env.CONFIG_KV === undefined
           ? ConfigDeferred
           : makeConfigKvLive(this.env.CONFIG_KV);
-      const layer = Layer.mergeAll(modelLayer, configLayer, scmLayer);
 
-      const exit = await Effect.runPromiseExit(
-        mrReviewCompute(input).pipe(Effect.provide(layer)),
+      let state: AgenticState = await stepDo("agentic-init", async () =>
+        Effect.runPromise(
+          initAgenticReview(input).pipe(Effect.provide(Layer.mergeAll(configLayer, scmLayer))),
+        ),
       );
-      return reviewOutcome(exit);
-    });
+      // Deterministic step names — a replay memoizes completed turns; the loop
+      // breaks on `state.done`, so the executed step sequence replays identically.
+      for (let i = 0; i < MAX_TURNS; i++) {
+        if (state.done) break;
+        state = await stepDo(`agentic-turn-${i + 1}`, async () =>
+          Effect.runPromise(runAgenticTurn(state).pipe(Effect.provide(modelLayer))),
+        );
+      }
+      // `finalizeAgentic` is pure — no step needed; wrap in a success Exit so the
+      // SAME `reviewOutcome` mapping (status + summary_json + note body) applies.
+      outcome = reviewOutcome(Exit.succeed(finalizeAgentic(input, state)));
+    } else {
+      // The single-shot COMPUTE (no post). Build the 3-Layer stack, each Layer
+      // degrading when its binding/secret is absent (config dies on read, model
+      // fails typed, scm fails auth-failed) — `mrReviewCompute` catches those
+      // into a failure note and never itself fails. `reviewOutcome` maps the
+      // Exit to the row fields + note body, logging the Cause on any defect.
+      outcome = await stepDo("review", async () => {
+        const modelLayer =
+          this.env.AI === undefined
+            ? ModelGatewayDeferred
+            : makeModelGatewayLive(
+                this.env.AI,
+                this.env.AI_GATEWAY_ID !== undefined && this.env.AI_GATEWAY_ID.length > 0
+                  ? this.env.AI_GATEWAY_ID
+                  : undefined,
+                // cloudflareAccountId / gatewayAuthToken / usageSink are unused in
+                // the PoC (no Bedrock, no D1 metering sink) — pass through to the
+                // OPENROUTER_API_KEY slot so the `openrouter/*` A/B backend works.
+                undefined,
+                undefined,
+                undefined,
+                this.env.OPENROUTER_API_KEY,
+              );
+        const configLayer =
+          this.env.CONFIG_KV === undefined
+            ? ConfigDeferred
+            : makeConfigKvLive(this.env.CONFIG_KV);
+        const layer = Layer.mergeAll(modelLayer, configLayer, scmLayer);
+
+        const exit = await Effect.runPromiseExit(
+          mrReviewCompute(input).pipe(Effect.provide(layer)),
+        );
+        return reviewOutcome(exit);
+      });
+    }
 
     // 3. Post the note — its OWN durable step, so a replay after a completed
     //    post never re-posts the model fan-out's note. Best-effort: a post
