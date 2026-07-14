@@ -116,6 +116,20 @@ wrangler deploy --config $CFG
   + renders the note *without posting*; `GitlabReviewWorkflow` posts it in a
   separate `post-review` step, so a mid-flight Workflow replay re-runs neither
   the model fan-out nor the note post twice.
+- **Per-run cost footer.** The model gateway now surfaces Workers AI token usage
+  (the workers-ai route dropped the response `usage` block; other backends
+  already parsed it). `mr-review` aggregates usage across the fan-out via a
+  metering `ModelGateway` wrapper (no engine change), prices it through
+  `runs/mr-review-cost.ts` (a per-model $/M-token table overridable via CONFIG_KV
+  `pr-review.pricing.<model>`), and renders a footer above the marker
+  (`⚙️ <model> · <in> in + <out> out tokens · ~<n> neurons · ≈$<usd>`). No usage →
+  no footer; usage but no price → tokens only. Totals persist into the D1
+  `summary_json`.
+- **Quota-graceful degradation.** A rate-limited model failure (free-plan neuron
+  exhaustion → 429), matched on the typed `ModelCallFailed.reason`, does NOT post
+  a failure note — it logs a warning and records status `skipped-quota` in the D1
+  row (the `post-review` step posts nothing on a null body). Non-rate-limit
+  failures keep the visible "could not complete" note.
 
 ## Phased upstream outline
 
