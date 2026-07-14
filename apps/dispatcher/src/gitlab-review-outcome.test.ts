@@ -20,13 +20,19 @@ afterEach(() => vi.restoreAllMocks());
 const usage = { inputTokens: 14230, outputTokens: 1872 };
 
 describe("reviewOutcome", () => {
-  it("success (output present) → status success + summaryJson (output + usage) + the note body", () => {
-    const compute: MrComputeResult = { status: "success", output, usage, noteBody: "the note" };
+  it("success (output present) → status success + summaryJson (output + usage + grounded) + the note body", () => {
+    const compute: MrComputeResult = {
+      status: "success",
+      output,
+      usage,
+      grounded: true,
+      noteBody: "the note",
+    };
     const out = reviewOutcome(Exit.succeed(compute));
     expect(out.status).toBe("success");
     expect(out.noteBody).toBe("the note");
-    // summary_json carries the review output AND the aggregated token usage.
-    expect(JSON.parse(out.summaryJson!)).toEqual({ ...output, usage });
+    // summary_json carries the review output, the token usage, AND the A/B arm.
+    expect(JSON.parse(out.summaryJson!)).toEqual({ ...output, usage, grounded: true });
   });
 
   it("compute-level failure (output null) → status failure, summaryJson null, failure note", () => {
@@ -34,6 +40,7 @@ describe("reviewOutcome", () => {
       status: "failure",
       output: null,
       usage: null,
+      grounded: false,
       noteBody: "could not complete",
     };
     const out = reviewOutcome(Exit.succeed(compute));
@@ -47,6 +54,7 @@ describe("reviewOutcome", () => {
       status: "skipped-quota",
       output: null,
       usage: null,
+      grounded: false,
       noteBody: null,
     };
     const out = reviewOutcome(Exit.succeed(compute));

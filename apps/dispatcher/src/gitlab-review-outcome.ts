@@ -38,9 +38,13 @@ export const reviewOutcome = (
   Exit.match(exit, {
     onSuccess: (r) => ({
       status: r.status,
-      // Persist the review output AND the aggregated token usage into
-      // summary_json so the D1 row carries the per-run cost inputs.
-      summaryJson: r.output !== null ? JSON.stringify({ ...r.output, usage: r.usage }) : null,
+      // Persist the review output, the aggregated token usage, AND whether the
+      // run was retrieval-grounded (the A/B arm) so the D1 row carries the
+      // per-run cost inputs and the grounded/diff-only label.
+      summaryJson:
+        r.output !== null
+          ? JSON.stringify({ ...r.output, usage: r.usage, grounded: r.grounded })
+          : null,
       noteBody: r.noteBody,
     }),
     onFailure: (cause) => {

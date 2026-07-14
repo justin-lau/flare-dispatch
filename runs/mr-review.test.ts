@@ -9,7 +9,9 @@
 
 import { it } from "@effect/vitest";
 import { Effect, Exit, Layer } from "effect";
-import { describe, expect } from "vitest";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { afterAll, afterEach, beforeAll, describe, expect } from "vitest";
 import { ModelGatewayError } from "@flare-dispatch/core";
 import {
   makeConfigFake,
@@ -17,6 +19,11 @@ import {
   makeScmFake,
 } from "@flare-dispatch/core/testing";
 import { mrInputsFromPayload, mrReview, mrReviewProgram, type MrReviewInput } from "./mr-review";
+
+const hakiri = setupServer();
+beforeAll(() => hakiri.listen({ onUnhandledRequest: "bypass" }));
+afterEach(() => hakiri.resetHandlers());
+afterAll(() => hakiri.close());
 
 const baseInput: MrReviewInput = {
   projectId: "42",
@@ -154,6 +161,58 @@ describe("mr-review", () => {
       expect(Exit.isFailure(exit)).toBe(true);
       // …crucially it posts NOTHING — no scary failure note on a quota burn.
       expect(scmFake.state.postReviewCalls).toHaveLength(0);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("grounding OFF (no hakiri endpoint) → model sees the raw diff, NO context block", () => {
+    const scmFake = makeScmFake({
+      diff: "diff --git a/src/foo.ts b/src/foo.ts\n@@ -1 +1 @@\n-a\n+b\n",
+    });
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding] });
+    // backendConfig carries no pr-review.hakiri.* keys → grounding never runs.
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake(backendConfig));
+
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      const user = modelFake.state.requests[0]!.user;
+      expect(user).not.toContain("## Repository context");
+      expect(user).toContain("diff --git a/src/foo.ts");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("grounding ON → hakiri context is PREPENDED to the diff the model sees", () => {
+    hakiri.use(
+      http.post("https://hakiri.test/mcp", async ({ request }) => {
+        const body = (await request.json()) as { params: { name: string } };
+        const table =
+          body.params.name === "context.query"
+            ? { columns: ["path", "content"], rows: [["src/foo.ts", "export const grounded = 1;"]] }
+            : { columns: ["path", "snippet"], rows: [["src/near.ts", "neighbour snippet"]] };
+        return HttpResponse.json({ result: { content: [{ text: JSON.stringify(table) }] } });
+      }),
+    );
+    const scmFake = makeScmFake({
+      diff: "diff --git a/src/foo.ts b/src/foo.ts\n@@ -1 +1 @@\n-a\n+b\n",
+    });
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding] });
+    const layer = Layer.mergeAll(
+      scmFake.layer,
+      modelFake.layer,
+      makeConfigFake({ ...backendConfig, "pr-review.hakiri.endpoint": "https://hakiri.test" }),
+    );
+
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      const user = modelFake.state.requests[0]!.user;
+      // context block prepended, clearly labelled, with the injected content…
+      expect(user).toContain("## Repository context");
+      expect(user).toContain("export const grounded = 1;");
+      expect(user).toContain("neighbour snippet");
+      // …and the REAL diff still intact, AFTER the context block.
+      expect(user).toContain("diff --git a/src/foo.ts");
+      expect(user.indexOf("## Repository context")).toBeLessThan(
+        user.indexOf("diff --git a/src/foo.ts"),
+      );
     }).pipe(Effect.provide(layer));
   });
 

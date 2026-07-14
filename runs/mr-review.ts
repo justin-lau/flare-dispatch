@@ -71,6 +71,13 @@ import {
   pricingKey,
   resolvePricing,
 } from "./mr-review-cost";
+import {
+  changedPaths,
+  composeGroundedInput,
+  deriveQueries,
+  fetchContext,
+  type GroundingConfig,
+} from "./mr-review-grounding";
 
 /** Footer marker on every MR note this run posts — for idempotent updates. */
 const COMMENT_MARKER = "<!-- flare-dispatch: mr-review -->";
@@ -149,12 +156,15 @@ type ReviewOutput = typeof ReviewOutputSchema.Type;
  *                  durable step (see {@link mrPostNote}).
  *   * `usage` — aggregated model token usage across the fan-out (`null` when the
  *               review didn't run) — persisted into the D1 `summary_json`.
+ *   * `grounded` — whether hakiri retrieval context was injected into the model
+ *                  prompt (the A/B arm) — persisted into the D1 `summary_json`.
  */
 export type MrComputeResult = {
   readonly status: "success" | "failure" | "skipped-quota";
   readonly output: ReviewOutput | null;
   readonly noteBody: string | null;
   readonly usage: CostUsage | null;
+  readonly grounded: boolean;
 };
 
 /** Render the "could not complete" failure note — the reason is model-influenced
@@ -184,6 +194,7 @@ export const mrReviewCompute = (
         status: "success",
         output: r.output,
         usage: r.usage,
+        grounded: r.grounded,
         noteBody: renderReviewComment(input, r.output, footer),
       };
     }),
@@ -201,6 +212,7 @@ export const mrReviewCompute = (
               status: "skipped-quota",
               output: null,
               usage: null,
+              grounded: false,
               noteBody: null,
             }),
           )
@@ -208,6 +220,7 @@ export const mrReviewCompute = (
             status: "failure",
             output: null,
             usage: null,
+            grounded: false,
             noteBody: failureNote(describeError(err)),
           }),
     ),
@@ -275,8 +288,31 @@ const reviewBody = (input: MrReviewInput) =>
     const rawDiff = yield* scm.fetchDiff(ref);
     const diff = capDiff(stripDiffNoise(rawDiff), resolved.maxDiffChars);
 
-    // 3. Risk tier — pure heuristic on diff size + touched paths.
+    // 3. Risk tier — pure heuristic on the REAL diff (grounding, added below,
+    //    must not inflate the diff size the tier heuristic sees).
     const tier = yield* riskTier({ diff });
+
+    // 3b. Optional retrieval grounding (CONFIG_KV-gated, OFF by default). When
+    //     `pr-review.hakiri.endpoint` is set, fetch surrounding code from the
+    //     context store and PREPEND it to the diff as a delimited block — the
+    //     real diff is passed through intact, the context is ADDITIONAL headroom.
+    //     Best-effort: `fetchContext` never fails, and an empty result leaves the
+    //     run diff-only. `grounded` records whether context actually reached the
+    //     model (the A/B arm), persisted into summary_json.
+    const grounding = yield* resolveGrounding((key) => config.get(key));
+    let modelDiff = diff;
+    let grounded = false;
+    if (grounding !== undefined) {
+      const context = yield* fetchContext({
+        config: grounding,
+        queries: deriveQueries(diff),
+        paths: changedPaths(diff),
+      });
+      if (context.length > 0) {
+        modelDiff = composeGroundedInput(context, diff);
+        grounded = true;
+      }
+    }
 
     // 4. Agent fan-out mode — single generalist (default) vs tier-scaled personas.
     const agentMode = parseAgentMode(yield* config.get("pr-review.agents"));
@@ -313,7 +349,7 @@ const reviewBody = (input: MrReviewInput) =>
       (agent) =>
         reviewDomain({
           agent,
-          diff,
+          diff: modelDiff,
           tier: plan.tier,
           model: resolved.model,
           backend: resolved.backend,
@@ -342,7 +378,30 @@ const reviewBody = (input: MrReviewInput) =>
       resolved.model,
       parsePricingOverride(yield* config.get(pricingKey(resolved.model))),
     );
-    return { output: { ...coordinated, tier: plan.tier }, usage, model: resolved.model, pricing };
+    return {
+      output: { ...coordinated, tier: plan.tier },
+      usage,
+      model: resolved.model,
+      pricing,
+      grounded,
+    };
+  });
+
+/**
+ * Resolve the grounding config from CONFIG_KV — `undefined` when
+ * `pr-review.hakiri.endpoint` is unset/blank (grounding OFF, today's behaviour).
+ */
+const resolveGrounding = (
+  get: (key: string) => Effect.Effect<string | undefined, never, Config>,
+): Effect.Effect<GroundingConfig | undefined, never, Config> =>
+  Effect.gen(function* () {
+    const endpoint = (yield* get("pr-review.hakiri.endpoint"))?.trim();
+    if (endpoint === undefined || endpoint === "") return undefined;
+    const token = (yield* get("pr-review.hakiri.token"))?.trim();
+    return {
+      endpoint,
+      ...(token !== undefined && token !== "" ? { token } : {}),
+    };
   });
 
 // ---------------------------------------------------------------------------
