@@ -152,7 +152,8 @@ describe("POST /v1/webhooks/gitlab", () => {
     expect(res.status).toBe(202);
     expect(reviewWorkflow.calls).toHaveLength(1);
     const call = reviewWorkflow.calls[0]!;
-    expect(call.id).toBe("mr-review:42:7:headsha12345");
+    // The semantic key is sanitized by toInstanceId — CF Workflows rejects ":".
+    expect(call.id).toBe("mr-review_42_7_headsha12345");
     const params = call.params as { executionId: string; input: Record<string, unknown> };
     expect(params.input).toMatchObject({
       projectId: "42",

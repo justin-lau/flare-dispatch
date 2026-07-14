@@ -19,6 +19,7 @@
 // so a `===` early-return can't leak the secret's length/prefix via timing.
 
 import type { Env } from "../env";
+import { toInstanceId } from "../instance-id";
 import { mrInputsFromPayload } from "@flare-dispatch/runs/mr-review";
 
 /** GitLab's webhook secret-token header. */
@@ -197,7 +198,9 @@ export const handleGitlabWebhook = async (
   };
 
   // 8. Dispatch — a stable id collapses redeliveries at the platform layer.
-  const id = `mr-review:${input.projectId}:${input.iid}:${input.headSha.slice(0, 12)}`;
+  // The semantic key MUST pass through toInstanceId: CF Workflows accepts only
+  // [A-Za-z0-9_-] (≤64 chars) — a raw `:`-joined key fails instance.invalid_id.
+  const id = toInstanceId(`mr-review:${input.projectId}:${input.iid}:${input.headSha.slice(0, 12)}`);
   try {
     await env.GITLAB_REVIEW_WORKFLOW.create({ id, params: { executionId: id, input } });
   } catch (cause) {
