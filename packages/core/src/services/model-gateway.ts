@@ -105,6 +105,19 @@ export type ModelCompletionResult = {
    */
   readonly inputTokens?: number;
   readonly outputTokens?: number;
+  /**
+   * Optional provider-reported EXACT charge in USD. Some backends (e.g.
+   * OpenRouter with usage accounting) return the real dollar cost of the call;
+   * a caller doing cost attribution should prefer this over a per-M-token
+   * estimate. Backends without a cost figure leave it undefined.
+   */
+  readonly costUsd?: number;
+  /**
+   * Optional count of reasoning/thinking tokens a reasoning model spent before
+   * the final answer (e.g. OpenRouter's `completion_tokens_details.reasoning_tokens`).
+   * Informational only; undefined when the backend doesn't report it.
+   */
+  readonly reasoningTokens?: number;
 };
 
 /**

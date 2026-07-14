@@ -538,6 +538,13 @@ type OpenAiChatResponse = {
   readonly usage?: {
     readonly prompt_tokens?: number;
     readonly completion_tokens?: number;
+    /**
+     * OpenRouter usage-accounting extras (present only when the request asked
+     * for `usage:{include:true}`): the exact call cost in USD, and the reasoning
+     * tokens a reasoning model spent. DeepSeek/other OpenAI backends omit these.
+     */
+    readonly cost?: number;
+    readonly completion_tokens_details?: { readonly reasoning_tokens?: number };
   };
 };
 
@@ -591,6 +598,7 @@ const fromOpenAiChat = (
       name: c.function!.name as string,
       arguments: c.function?.arguments,
     }));
+  const reasoningTokens = parsed.usage?.completion_tokens_details?.reasoning_tokens;
   return {
     toolCalls,
     text: typeof message?.content === "string" ? message.content : "",
@@ -600,6 +608,10 @@ const fromOpenAiChat = (
     ...(typeof parsed.usage?.completion_tokens === "number"
       ? { outputTokens: parsed.usage.completion_tokens }
       : {}),
+    // OpenRouter usage accounting — the exact charge + reasoning tokens (other
+    // OpenAI-shape backends omit these, leaving the fields undefined).
+    ...(typeof parsed.usage?.cost === "number" ? { costUsd: parsed.usage.cost } : {}),
+    ...(typeof reasoningTokens === "number" ? { reasoningTokens } : {}),
   } satisfies ModelCompletionResult;
 };
 
@@ -688,6 +700,122 @@ const completeDeepSeek = (
           model: req.model,
           reason: "bad-response",
           message: "deepseek response body was not valid JSON",
+        }),
+    });
+
+    return fromOpenAiChat(parsed);
+  });
+
+// ---------------------------------------------------------------------------
+// The OpenRouter route (OpenAI-compatible Chat Completions, direct key).
+//
+// UNLIKE anthropic/deepseek (which route via the AI Gateway with a BYOK key the
+// gateway injects), OpenRouter is called DIRECTLY with an `OPENROUTER_API_KEY`
+// wrangler secret as `Authorization: Bearer`. The wire shape is OpenAI Chat
+// Completions, so the response parses through the same `fromOpenAiChat`; the
+// request adds `usage:{include:true}` to opt into OpenRouter's usage accounting
+// (the exact `usage.cost` + `reasoning_tokens` the cost footer prefers). Frontier
+// reasoning models (deepseek-v4-pro) are driven in JSON/prompt mode — the engine
+// sends NO tools on this backend, and the final answer is in `message.content`
+// (the separate `message.reasoning` field is ignored).
+
+/** Model ids carrying this prefix route directly to OpenRouter. */
+const OPENROUTER_PREFIX = "openrouter/";
+const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_DEFAULT_MAX_TOKENS = 2048;
+/** Recommended (optional) attribution headers OpenRouter surfaces on the dashboard. */
+const OPENROUTER_REFERER = "https://github.com/OpenHackersClub/flare-dispatch";
+const OPENROUTER_TITLE = "flare-dispatch";
+
+/**
+ * Build the OpenRouter request body — the OpenAI Chat Completions shape plus
+ * `usage:{include:true}` (opt into cost accounting). The engine drives this
+ * backend in json/prompt mode (no tools), so `response_format: json_object` is
+ * set when a json schema is present; tool-calling is intentionally unsupported.
+ */
+const openRouterBody = (req: ModelCompletionRequest, model: string): unknown => ({
+  model,
+  max_tokens: req.maxTokens ?? OPENROUTER_DEFAULT_MAX_TOKENS,
+  messages: [
+    { role: "system", content: req.system },
+    { role: "user", content: req.user },
+  ],
+  ...(req.jsonSchema !== undefined ? { response_format: { type: "json_object" } } : {}),
+  ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
+  // Opt into OpenRouter usage accounting → usage.cost + reasoning_tokens.
+  usage: { include: true },
+});
+
+/**
+ * The OpenRouter route — a direct POST with the deploy's `OPENROUTER_API_KEY`.
+ * A missing key fails `auth-failed` naming the secret (the key itself is NEVER
+ * logged). Non-2xx maps by status like the other OpenAI-shape routes.
+ */
+const completeOpenRouter = (
+  apiKey: string | undefined,
+  req: ModelCompletionRequest,
+): Effect.Effect<ModelCompletionResult, ModelGatewayError> =>
+  Effect.gen(function* () {
+    if (apiKey === undefined || apiKey.trim() === "") {
+      return yield* Effect.fail(
+        new ModelGatewayError({
+          model: req.model,
+          reason: "auth-failed",
+          message:
+            "openrouter/* models need an OPENROUTER_API_KEY secret on the dispatcher (set it with `wrangler secret put OPENROUTER_API_KEY`)",
+        }),
+      );
+    }
+    const model = req.model.slice(OPENROUTER_PREFIX.length);
+
+    const response = yield* Effect.tryPromise({
+      try: () =>
+        fetch(OPENROUTER_ENDPOINT, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${apiKey}`,
+            "http-referer": OPENROUTER_REFERER,
+            "x-title": OPENROUTER_TITLE,
+          },
+          body: JSON.stringify(openRouterBody(req, model)),
+        }),
+      catch: (cause) => {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        return new ModelGatewayError({
+          model: req.model,
+          reason: reasonFor(message),
+          message: `OpenRouter request failed: ${message}`,
+        });
+      },
+    });
+
+    if (!response.ok) {
+      const bodyText = yield* Effect.tryPromise({
+        try: () => response.text(),
+        catch: () =>
+          new ModelGatewayError({
+            model: req.model,
+            reason: reasonForStatus(response.status),
+            message: `openrouter returned ${response.status} (unreadable body)`,
+          }),
+      });
+      return yield* Effect.fail(
+        new ModelGatewayError({
+          model: req.model,
+          reason: reasonForStatus(response.status),
+          message: `openrouter returned ${response.status}: ${bodyText.slice(0, 300)}`,
+        }),
+      );
+    }
+
+    const parsed = yield* Effect.tryPromise({
+      try: () => response.json() as Promise<OpenAiChatResponse>,
+      catch: () =>
+        new ModelGatewayError({
+          model: req.model,
+          reason: "bad-response",
+          message: "openrouter response body was not valid JSON",
         }),
     });
 
@@ -822,10 +950,11 @@ const completeBedrock = (
 /**
  * Build the `ModelGateway` Layer. The model id prefix selects the route:
  *
- *   `bedrock/<model>`   → AI Gateway Bedrock forwarder (SigV4, BYOC creds)
- *   `anthropic/<model>` → AI Gateway universal endpoint (BYOK Anthropic key)
- *   `deepseek/<model>`  → AI Gateway universal endpoint (BYOK DeepSeek key)
- *   anything else       → Workers AI catalog (`@cf/...`)
+ *   `bedrock/<model>`     → AI Gateway Bedrock forwarder (SigV4, BYOC creds)
+ *   `anthropic/<model>`   → AI Gateway universal endpoint (BYOK Anthropic key)
+ *   `deepseek/<model>`    → AI Gateway universal endpoint (BYOK DeepSeek key)
+ *   `openrouter/<model>`  → OpenRouter direct (OPENROUTER_API_KEY secret)
+ *   anything else         → Workers AI catalog (`@cf/...`)
  *
  * @param ai                   `env.AI` — the Workers AI binding.
  * @param gatewayId            optional AI Gateway id (`AI_GATEWAY_ID`). Required
@@ -842,6 +971,9 @@ const completeBedrock = (
  *                             universal endpoint), which has no header seam, so
  *                             an authenticated gateway must allow first-party
  *                             Workers AI binding traffic.
+ * @param openRouterApiKey     optional `OPENROUTER_API_KEY` secret. Required for
+ *                             the `openrouter/*` route (direct-key, NOT via the
+ *                             gateway); absent → that route fails `auth-failed`.
  */
 /**
  * Where the gateway records per-call token usage for cost attribution — the D1
@@ -894,6 +1026,7 @@ export const makeModelGatewayLive = (
   cloudflareAccountId?: string,
   gatewayAuthToken?: string,
   usageSink?: ModelUsageSink,
+  openRouterApiKey?: string,
 ): Layer.Layer<ModelGateway> => {
   const route = (req: ModelCompletionRequest) =>
     req.model.startsWith(BEDROCK_PREFIX)
@@ -902,7 +1035,9 @@ export const makeModelGatewayLive = (
         ? completeAnthropic(ai, gatewayId, gatewayAuthToken, req)
         : req.model.startsWith(DEEPSEEK_PREFIX)
           ? completeDeepSeek(ai, gatewayId, gatewayAuthToken, req)
-          : completeWorkersAi(ai, gatewayId, req);
+          : req.model.startsWith(OPENROUTER_PREFIX)
+            ? completeOpenRouter(openRouterApiKey, req)
+            : completeWorkersAi(ai, gatewayId, req);
 
   const service: ModelGatewayService = {
     complete: (req) =>

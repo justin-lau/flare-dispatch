@@ -717,3 +717,124 @@ describe("makeModelGatewayLive — bedrock-via-AI-Gateway route", () => {
     expect(exit._tag).toBe("Failure");
   });
 });
+
+// --- The OpenRouter direct route --------------------------------------------
+
+describe("makeModelGatewayLive — openrouter direct route", () => {
+  /** A `fetch` stub recording url/headers/body, returning a canned OpenAI response. */
+  const stubFetch = (
+    payload: unknown,
+    status = 200,
+  ): {
+    fetchImpl: typeof fetch;
+    seen: { url?: string; headers?: Record<string, string>; body?: string };
+  } => {
+    const seen: { url?: string; headers?: Record<string, string>; body?: string } = {};
+    const fetchImpl = ((url: string, init: RequestInit) => {
+      seen.url = url;
+      seen.headers = init.headers as Record<string, string>;
+      seen.body = init.body as string;
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }) as unknown as typeof fetch;
+    return { fetchImpl, seen };
+  };
+
+  const withFetch = async <T>(fetchImpl: typeof fetch, fn: () => Promise<T>): Promise<T> => {
+    const original = globalThis.fetch;
+    (globalThis as { fetch: typeof fetch }).fetch = fetchImpl;
+    try {
+      return await fn();
+    } finally {
+      (globalThis as { fetch: typeof fetch }).fetch = original;
+    }
+  };
+
+  const inertAi = {} as unknown as AiBinding;
+  // The OPENROUTER_API_KEY is the 6th positional arg (after usageSink).
+  const withKey = (key: string | undefined) =>
+    makeModelGatewayLive(inertAi, undefined, undefined, undefined, undefined, key);
+
+  it("POSTs OpenRouter with the bearer key, strips the prefix, maps content + cost + reasoning", async () => {
+    const { fetchImpl, seen } = stubFetch({
+      choices: [{ message: { content: '{"findings":[]}' } }],
+      usage: {
+        prompt_tokens: 9000,
+        completion_tokens: 1200,
+        cost: 0.00533,
+        completion_tokens_details: { reasoning_tokens: 512 },
+      },
+    });
+    const result = await withFetch(fetchImpl, () =>
+      Effect.runPromise(
+        modelGateway
+          .complete({
+            model: "openrouter/deepseek/deepseek-v4-pro",
+            system: "you are a reviewer",
+            user: "review this",
+            jsonSchema: { type: "object" },
+            maxTokens: 4096,
+          })
+          .pipe(Effect.provide(withKey("sk-or-secret"))),
+      ),
+    );
+
+    // content → text; usage → tokens; OpenRouter extras → costUsd + reasoningTokens.
+    expect(result.text).toBe('{"findings":[]}');
+    expect(result.toolCalls).toEqual([]);
+    expect(result.inputTokens).toBe(9000);
+    expect(result.outputTokens).toBe(1200);
+    expect(result.costUsd).toBe(0.00533);
+    expect(result.reasoningTokens).toBe(512);
+
+    // Direct endpoint, bearer auth (key present in the header, never logged elsewhere).
+    expect(seen.url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect(seen.headers?.authorization).toBe("Bearer sk-or-secret");
+    const body = JSON.parse(seen.body!) as Record<string, unknown>;
+    // The `openrouter/` prefix is stripped — OpenRouter gets `deepseek/deepseek-v4-pro`.
+    expect(body.model).toBe("deepseek/deepseek-v4-pro");
+    expect(body.max_tokens).toBe(4096);
+    expect(body.messages).toEqual([
+      { role: "system", content: "you are a reviewer" },
+      { role: "user", content: "review this" },
+    ]);
+    // json/prompt mode — response_format set, NO tools sent.
+    expect(body.response_format).toEqual({ type: "json_object" });
+    expect("tools" in body).toBe(false);
+    // usage accounting opted in (so cost + reasoning come back).
+    expect(body.usage).toEqual({ include: true });
+  });
+
+  it("fails auth-failed when OPENROUTER_API_KEY is absent (never reaches the network)", async () => {
+    let called = false;
+    const fetchImpl = (() => {
+      called = true;
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }) as unknown as typeof fetch;
+    const exit = await withFetch(fetchImpl, () =>
+      Effect.runPromiseExit(
+        modelGateway
+          .complete({ model: "openrouter/deepseek/deepseek-v4-pro", system: "s", user: "u" })
+          .pipe(Effect.provide(withKey(undefined))),
+      ),
+    );
+    expect(exit._tag).toBe("Failure");
+    expect(called).toBe(false);
+  });
+
+  it("maps a non-2xx OpenRouter response to ModelGatewayError by status", async () => {
+    const { fetchImpl } = stubFetch({ error: { message: "insufficient credits" } }, 402);
+    const exit = await withFetch(fetchImpl, () =>
+      Effect.runPromiseExit(
+        modelGateway
+          .complete({ model: "openrouter/deepseek/deepseek-v4-pro", system: "s", user: "u" })
+          .pipe(Effect.provide(withKey("sk-or-secret"))),
+      ),
+    );
+    expect(exit._tag).toBe("Failure");
+  });
+});
