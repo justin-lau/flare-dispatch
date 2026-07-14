@@ -95,10 +95,15 @@ export const fetchMergeRequestDiff = async (
   const project = encodeProjectId(opts.projectId);
   const files: GitlabMrDiffFile[] = [];
 
+  // Defence in depth: `iid` is a caller-supplied value; encode it into the path
+  // so a non-numeric value can never inject extra path segments (the webhook
+  // route also validates it is a positive integer BEFORE reaching here).
+  const iid = encodeURIComponent(String(opts.iid));
+
   let page = 1;
   for (let i = 0; i < MAX_DIFF_PAGES; i++) {
     const res = await doFetch(
-      `${apiBase}/projects/${project}/merge_requests/${opts.iid}/diffs?per_page=100&page=${page}`,
+      `${apiBase}/projects/${project}/merge_requests/${iid}/diffs?per_page=100&page=${page}`,
       { method: "GET", headers: glHeaders(opts.token) },
     );
     await assertOk(res, "merge-request diffs fetch failed");
@@ -141,8 +146,9 @@ export const postMergeRequestNote = async (
 ): Promise<void> => {
   const { apiBase, doFetch } = resolveClient(opts);
   const project = encodeProjectId(opts.projectId);
+  const iid = encodeURIComponent(String(opts.iid));
   const res = await doFetch(
-    `${apiBase}/projects/${project}/merge_requests/${opts.iid}/notes`,
+    `${apiBase}/projects/${project}/merge_requests/${iid}/notes`,
     {
       method: "POST",
       headers: glHeaders(opts.token, { json: true }),

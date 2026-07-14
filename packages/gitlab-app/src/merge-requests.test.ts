@@ -125,6 +125,25 @@ describe("fetchMergeRequestDiff", () => {
     expect(diff.match(/diff --git/g)).toHaveLength(2);
   });
 
+  it("URL-encodes a non-numeric iid so it cannot inject path segments", async () => {
+    let seenUrl = "";
+    server.use(
+      http.get(`${BASE}/projects/:project/merge_requests/:iid/diffs`, ({ request }) => {
+        seenUrl = request.url;
+        return HttpResponse.json([], { headers: { "x-next-page": "" } });
+      }),
+    );
+    // A forged iid carrying a path-traversal payload.
+    await fetchMergeRequestDiff({
+      token: "t",
+      projectId: 1,
+      iid: "../../projects/2/merge_requests/1" as unknown as number,
+    });
+    // The slashes are percent-encoded — no extra `/projects/2/...` segments leak.
+    expect(seenUrl).toContain("%2F");
+    expect(seenUrl).not.toContain("/projects/2/merge_requests/1/diffs");
+  });
+
   it("surfaces a 401 as a normalized GitlabApiError", async () => {
     server.use(
       http.get(`${BASE}/projects/:project/merge_requests/:iid/diffs`, () =>
