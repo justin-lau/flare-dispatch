@@ -70,6 +70,49 @@ describe("POST /v1/webhooks/gitlab", () => {
     expect(reviewWorkflow.calls).toHaveLength(0);
   });
 
+  it("empty/whitespace webhook secret is treated as unconfigured → 503", async () => {
+    const reviewWorkflow = makeFakeWorkflow();
+    const env: Env = makeFakeEnv({
+      hmacSecret: "unused",
+      workflow: makeFakeWorkflow(),
+      storage: makeFakeR2(),
+      gitlabWebhookSecret: "   ",
+      gitlabReviewWorkflow: reviewWorkflow.binding,
+    });
+    const res = await handleRequest(gitlabRequest(mrPayload(), { token: "   " }), env);
+    expect(res.status).toBe(503);
+    expect(reviewWorkflow.calls).toHaveLength(0);
+  });
+
+  it("forged non-integer iid → 400, no dispatch", async () => {
+    const { env, reviewWorkflow } = fixture();
+    const forged = {
+      object_kind: "merge_request",
+      project: { id: 1, web_url: "https://gitlab.com/g/p" },
+      object_attributes: {
+        iid: "../../projects/2/merge_requests/1",
+        action: "open",
+        last_commit: { id: "sha" },
+        diff_refs: { base_sha: "b", head_sha: "h" },
+      },
+    };
+    const res = await handleRequest(gitlabRequest(forged, { token: WEBHOOK_SECRET }), env);
+    expect(res.status).toBe(400);
+    expect(reviewWorkflow.calls).toHaveLength(0);
+  });
+
+  it("non-positive project.id → 400, no dispatch", async () => {
+    const { env, reviewWorkflow } = fixture();
+    const bad = {
+      object_kind: "merge_request",
+      project: { id: 0, web_url: "https://gitlab.com/g/p" },
+      object_attributes: { iid: 7, action: "open", last_commit: { id: "sha" }, diff_refs: { base_sha: "b", head_sha: "h" } },
+    };
+    const res = await handleRequest(gitlabRequest(bad, { token: WEBHOOK_SECRET }), env);
+    expect(res.status).toBe(400);
+    expect(reviewWorkflow.calls).toHaveLength(0);
+  });
+
   it("bad X-Gitlab-Token → 401", async () => {
     const { env, reviewWorkflow } = fixture();
     const res = await handleRequest(gitlabRequest(mrPayload(), { token: "wrong" }), env);

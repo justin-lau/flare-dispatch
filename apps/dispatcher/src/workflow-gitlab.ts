@@ -7,18 +7,20 @@
 //
 //   1. insert-execution — a minimal `executions` D1 row (status running).
 //   2. review           — build the 3-Layer stack (modelGateway + config + the
-//                         GitLab `scm`) and run `mrReviewProgram`. The program
-//                         posts the MR note itself (success OR failure) and
-//                         returns the review output; we record its verdict.
-//   3. finalize         — update the row's terminal status + summary.
+//                         GitLab `scm`) and run `mrReviewCompute` (fetch + model
+//                         fan-out + render — but NOT post). Yields the verdict +
+//                         the rendered note body.
+//   3. post-review      — post the note (its OWN step, so a mid-flight replay
+//                         re-runs neither the model fan-out NOR the post twice).
+//   4. finalize         — update the row's terminal status + summary.
 //
 // Each step is idempotent: a Workflow resume replays the memoized result rather
-// than re-running the body (so the note is not re-posted on a retry). NO
-// container / browser imports live here — the PoC deploy binds neither.
+// than re-running the body. NO container / browser imports live here — the PoC
+// deploy binds neither.
 
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { Effect, Exit, Layer } from "effect";
+import { Effect, Layer } from "effect";
 import {
   ConfigDeferred,
   makeConfigKvLive,
@@ -26,7 +28,12 @@ import {
   makeModelGatewayLive,
   ModelGatewayDeferred,
 } from "@flare-dispatch/runtime-cf";
-import { mrReviewProgram, type MrReviewInput } from "@flare-dispatch/runs/mr-review";
+import {
+  mrPostNote,
+  mrReviewCompute,
+  type MrReviewInput,
+} from "@flare-dispatch/runs/mr-review";
+import { reviewOutcome } from "./gitlab-review-outcome";
 import type { Env } from "./env";
 
 /** The Workflow params the GitLab webhook route creates each instance with. */
@@ -74,9 +81,16 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
       return { inserted: true };
     });
 
-    // 2. The review. Build the 3-Layer stack, each Layer degrading when its
-    //    binding/secret is absent (config dies on read, model fails typed, scm
-    //    fails auth-failed) — the program's error boundary posts an honest note.
+    // The GitLab `scm` Layer — built once, reused by the review + post steps.
+    const scmLayer = makeGitlabScmLive(
+      this.env.GITLAB_TOKEN !== undefined ? { token: this.env.GITLAB_TOKEN } : {},
+    );
+
+    // 2. The review COMPUTE (no post). Build the 3-Layer stack, each Layer
+    //    degrading when its binding/secret is absent (config dies on read, model
+    //    fails typed, scm fails auth-failed) — `mrReviewCompute` catches those
+    //    into a failure note and never itself fails. `reviewOutcome` maps the
+    //    Exit to the row fields + note body, logging the Cause on any defect.
     const outcome = await stepDo("review", async () => {
       const modelLayer =
         this.env.AI === undefined
@@ -91,21 +105,30 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
         this.env.CONFIG_KV === undefined
           ? ConfigDeferred
           : makeConfigKvLive(this.env.CONFIG_KV);
-      const scmLayer = makeGitlabScmLive(
-        this.env.GITLAB_TOKEN !== undefined ? { token: this.env.GITLAB_TOKEN } : {},
-      );
       const layer = Layer.mergeAll(modelLayer, configLayer, scmLayer);
 
       const exit = await Effect.runPromiseExit(
-        mrReviewProgram(input).pipe(Effect.provide(layer)),
+        mrReviewCompute(input).pipe(Effect.provide(layer)),
       );
-      return Exit.match(exit, {
-        onSuccess: (out) => ({ status: "success" as const, summaryJson: JSON.stringify(out) }),
-        onFailure: () => ({ status: "failure" as const, summaryJson: null }),
-      });
+      return reviewOutcome(exit);
     });
 
-    // 3. Terminal status + summary.
+    // 3. Post the note — its OWN durable step, so a replay after a completed
+    //    post never re-posts the model fan-out's note. Best-effort: a post
+    //    failure is logged, never fails the (already-computed) review.
+    await stepDo("post-review", async () => {
+      await Effect.runPromise(
+        mrPostNote(input, outcome.noteBody).pipe(
+          Effect.provide(scmLayer),
+          Effect.catchAll((e) =>
+            Effect.logWarning(`gitlab-review: posting MR note failed — ${String(e)}`),
+          ),
+        ),
+      );
+      return { posted: true };
+    });
+
+    // 4. Terminal status + summary.
     await stepDo("finalize", async () => {
       await db
         .prepare(

@@ -99,8 +99,11 @@ export const handleGitlabWebhook = async (
   request: Request,
   env: Env,
 ): Promise<Response> => {
-  // 1. Opt-in: refuse if no webhook secret is provisioned.
-  if (env.GITLAB_WEBHOOK_SECRET === undefined) {
+  // 1. Opt-in: refuse if no webhook secret is provisioned. An empty / whitespace
+  //    secret is treated as UNSET (never as a valid credential) — otherwise a
+  //    blank env var would accept an empty X-Gitlab-Token.
+  const secret = env.GITLAB_WEBHOOK_SECRET;
+  if (secret === undefined || secret.trim().length === 0) {
     return json(
       {
         error: "webhook_not_configured",
@@ -112,7 +115,7 @@ export const handleGitlabWebhook = async (
 
   // 2. Constant-time verify X-Gitlab-Token against the secret.
   const token = request.headers.get(TOKEN_HEADER) ?? "";
-  const ok = await constantTimeEqual(token, env.GITLAB_WEBHOOK_SECRET);
+  const ok = await constantTimeEqual(token, secret);
   if (!ok) {
     return json(
       { error: "unauthorized", message: "X-Gitlab-Token missing or invalid" },
@@ -141,6 +144,20 @@ export const handleGitlabWebhook = async (
     return noContent();
   }
 
+  // 4b. Validate the identifiers BEFORE they are interpolated into a GitLab API
+  //     URL. `project.id` + `iid` MUST be positive integers — a forged string
+  //     (e.g. "../../projects/2/merge_requests/1") is rejected here (defence in
+  //     depth over gitlab-app's own URL-encoding). 400: the token verified, so a
+  //     malformed body is a client/config error, not a silent ignore.
+  const projectId = Math.trunc(Number(payload.project?.id));
+  const iid = Math.trunc(Number(payload.object_attributes?.iid));
+  if (!Number.isInteger(projectId) || projectId <= 0 || !Number.isInteger(iid) || iid <= 0) {
+    return json(
+      { error: "invalid_payload", message: "project.id and object_attributes.iid must be positive integers" },
+      400,
+    );
+  }
+
   // 5. Optional receiver-level dedup on the delivery UUID.
   const deliveryId = request.headers.get(EVENT_UUID_HEADER);
   if (deliveryId !== null && deliveryId.length > 0 && env.IDEMPOTENCY_KV !== undefined) {
@@ -164,9 +181,13 @@ export const handleGitlabWebhook = async (
   }
 
   // 7. Extract the run inputs (mrInputsFromPayload is the run's canonical
-  //    mapping — prefers diff_refs endpoints). Add source/target branch context.
+  //    mapping — prefers diff_refs endpoints). Override projectId/iid with the
+  //    VALIDATED integers above (mrInputsFromPayload coerces; these are checked).
+  //    Add source/target branch context.
   const input = {
     ...mrInputsFromPayload(payload),
+    projectId: String(projectId),
+    iid,
     ...(payload.object_attributes?.source_branch !== undefined
       ? { sourceBranch: payload.object_attributes.source_branch }
       : {}),
