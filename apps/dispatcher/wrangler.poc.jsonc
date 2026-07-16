@@ -34,22 +34,19 @@
     }
   ],
 
-  // D1 — the `executions` metadata rows the Workflow writes. Reuses the SAME
-  // migrations dir as the main deploy (infra/migrations, relative to this
-  // config). Provision a fresh DB (`wrangler d1 create flare-dispatch-gitlab-poc`)
-  // and paste its id over the placeholder below before deploying.
-  "d1_databases": [
-    {
-      "binding": "RUNS_METADATA",
-      "database_name": "flare-dispatch-gitlab-poc",
-      "database_id": "2289374b-600a-4a32-bc57-20ceb8dc2db5",
-      "migrations_dir": "../../infra/migrations"
-    }
-  ],
+  // D1 (RUNS_METADATA) — REMOVED for the koukitsuko eval deploy (KOU-31): the
+  // scoped deploy token has no D1 permission, and the `executions` rows are
+  // observability-only for the eval (results are harvested from the GitLab MR
+  // notes). workflow-gitlab.ts skips the insert/finalize writes when the
+  // binding is absent. To restore, re-add the block:
+  //   { "binding": "RUNS_METADATA", "database_name": "flare-dispatch-gitlab-poc",
+  //     "database_id": "<wrangler d1 create ...>", "migrations_dir": "../../infra/migrations" }
 
   // KV — the `config` capability. Reuses the shared `pr-review.*` keys so the
   // operator tunes the backend/model in one place (see specs/11-gitlab-poc.md).
   // Provision (`wrangler kv namespace create CONFIG_KV`) and paste the id.
+  // NOTE: the id is PER-ACCOUNT — harness/deploy-worker.sh (review-eval repo)
+  // substitutes the target account's namespace id at deploy time.
   "kv_namespaces": [
     {
       "binding": "CONFIG_KV",

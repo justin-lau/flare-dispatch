@@ -26,6 +26,7 @@ import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { Effect, Exit, Layer } from "effect";
 import {
+  type AiBinding,
   ConfigDeferred,
   makeConfigKvLive,
   makeGitlabScmLive,
@@ -71,11 +72,15 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
     // via `.bind(step)` throws `The RPC receiver does not implement "bind"`.
     const stepDo: StepDo = (name, cb) =>
       (step.do as unknown as StepDo)(name, cb);
-    const db = this.env.RUNS_METADATA;
+    // The `executions` D1 row is observability-only for the PoC — the review
+    // itself reads nothing back from it. Deploy shapes without a D1 binding
+    // (the koukitsuko eval account's token has no D1 scope) skip the row.
+    const db = this.env.RUNS_METADATA as D1Database | undefined;
 
     // 1. Minimal executions row. GitLab has no GitHub-style repo slug — use the
     //    project web URL as `repo`, the source branch as `ref`, the head sha.
     await stepDo("insert-execution", async () => {
+      if (db === undefined) return { inserted: false };
       await db
         .prepare(
           `INSERT OR IGNORE INTO executions (id, run, repo, ref, sha, status, started_at, input_json)
@@ -118,11 +123,16 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
       // The AGENTIC path — init once, then one durable step per model turn (a
       // transient failure at turn 6 must not re-bill turns 1–5), then map the
       // final serializable state onto the same review-outcome shape.
+      // Live whenever EITHER route can serve: the AI binding (workers-ai /
+      // gateway models) or an OpenRouter key (`openrouter/*` models, which
+      // never touch the binding — deploy shapes whose token has no Workers-AI
+      // scope strip the binding and run OpenRouter-only). Deferred only when
+      // neither exists.
       const modelLayer =
-        this.env.AI === undefined
+        this.env.AI === undefined && this.env.OPENROUTER_API_KEY === undefined
           ? ModelGatewayDeferred
           : makeModelGatewayLive(
-              this.env.AI,
+              this.env.AI as AiBinding,
               this.env.AI_GATEWAY_ID !== undefined && this.env.AI_GATEWAY_ID.length > 0
                 ? this.env.AI_GATEWAY_ID
                 : undefined,
@@ -162,11 +172,12 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
       // into a failure note and never itself fails. `reviewOutcome` maps the
       // Exit to the row fields + note body, logging the Cause on any defect.
       outcome = await stepDo("review", async () => {
+        // Same Live-when-either-route rule as the agentic path above.
         const modelLayer =
-          this.env.AI === undefined
+          this.env.AI === undefined && this.env.OPENROUTER_API_KEY === undefined
             ? ModelGatewayDeferred
             : makeModelGatewayLive(
-                this.env.AI,
+                this.env.AI as AiBinding,
                 this.env.AI_GATEWAY_ID !== undefined && this.env.AI_GATEWAY_ID.length > 0
                   ? this.env.AI_GATEWAY_ID
                   : undefined,
@@ -211,6 +222,7 @@ export class GitlabReviewWorkflow extends WorkflowEntrypoint<Env, GitlabReviewPa
 
     // 4. Terminal status + summary.
     await stepDo("finalize", async () => {
+      if (db === undefined) return { finalized: false };
       await db
         .prepare(
           `UPDATE executions SET status = ?, completed_at = ?, summary_json = ? WHERE id = ?`,
