@@ -889,10 +889,21 @@ const OPENROUTER_TITLE = "flare-dispatch";
  *     a retrieval tool OR answer). Tools and `response_format` are mutually
  *     exclusive here, so json mode is suppressed while tools are offered.
  */
-const openRouterBody = (req: ModelCompletionRequest, model: string): unknown => {
+const openRouterBody = (
+  req: ModelCompletionRequest,
+  model: string,
+  pinnedProvider?: string,
+): unknown => {
   const sendingTools = req.tools !== undefined && req.tools.length > 0;
   return {
     model,
+    // Upstream pin — comparability control for the review eval (KOU-31): all
+    // arms of a model must be served by ONE provider, so routing variance
+    // can't confound the substrate comparison. No fallbacks: a down provider
+    // must fail loud, not silently switch upstreams mid-matrix.
+    ...(pinnedProvider !== undefined
+      ? { provider: { order: [pinnedProvider], allow_fallbacks: false } }
+      : {}),
     max_tokens: req.maxTokens ?? OPENROUTER_DEFAULT_MAX_TOKENS,
     messages:
       req.messages !== undefined
@@ -944,7 +955,13 @@ const completeOpenRouter = (
         }),
       );
     }
-    const model = req.model.slice(OPENROUTER_PREFIX.length);
+    // `openrouter/vendor/model@provider` pins the serving upstream (see
+    // openRouterBody) — the `@provider` suffix rides the config's model id, so
+    // the pin flips per cell via CONFIG_KV without a redeploy.
+    const rawModel = req.model.slice(OPENROUTER_PREFIX.length);
+    const atIdx = rawModel.indexOf("@");
+    const model = atIdx > 0 ? rawModel.slice(0, atIdx) : rawModel;
+    const pinnedProvider = atIdx > 0 ? rawModel.slice(atIdx + 1) : undefined;
 
     const response = yield* Effect.tryPromise({
       try: () =>
@@ -956,7 +973,7 @@ const completeOpenRouter = (
             "http-referer": OPENROUTER_REFERER,
             "x-title": OPENROUTER_TITLE,
           },
-          body: JSON.stringify(openRouterBody(req, model)),
+          body: JSON.stringify(openRouterBody(req, model, pinnedProvider)),
         }),
       catch: (cause) => {
         const message = cause instanceof Error ? cause.message : String(cause);
