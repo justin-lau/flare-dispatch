@@ -1,0 +1,34 @@
+{
+  // Moonshot Org overlay of wrangler.poc.jsonc — the MR-review Worker for
+  // moonshot-industries/mtech-atomos-platform (MOO-198). Same trimmed shape:
+  // Worker + D1 + KV + AI binding + one Workflow. No containers, no browser.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "flare-dispatch-review",
+  "main": "src/index.poc.ts",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "ai": { "binding": "AI" },
+  "workflows": [
+    {
+      // Workflow names are account-scoped; the retired PoC left a
+      // `gitlab-review` behind, so this one carries the Worker name.
+      "name": "flare-dispatch-review-mr",
+      "binding": "GITLAB_REVIEW_WORKFLOW",
+      "class_name": "GitlabReviewWorkflow"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "RUNS_METADATA",
+      "database_name": "flare-dispatch-review",
+      "database_id": "b1008f51-093a-4caa-8a59-79edb039c0c1",
+      "migrations_dir": "../../infra/migrations"
+    }
+  ],
+  "kv_namespaces": [
+    { "binding": "CONFIG_KV", "id": "14e99372aef84fa0b218a95188c9f84d" },
+    { "binding": "IDEMPOTENCY_KV", "id": "26e39fe49667408d950fa5ba02466c4e" }
+  ],
+  "vars": { "VIEWER_ACCESS_MODE": "token-only" }
+}

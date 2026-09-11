@@ -21,6 +21,7 @@
 import type { Env } from "../env";
 import { toInstanceId } from "../instance-id";
 import { mrInputsFromPayload } from "@flare-dispatch/runs/mr-review";
+import { postMergeRequestNote } from "@flare-dispatch/gitlab-app";
 
 /** GitLab's webhook secret-token header. */
 const TOKEN_HEADER = "X-Gitlab-Token";
@@ -34,6 +35,8 @@ const MERGE_REQUEST_EVENT = "Merge Request Hook";
 const REVIEWABLE_ACTIONS = new Set(["open", "reopen", "update"]);
 /** TTL on receiver-dedup KV entries (24h) — matches the GitHub route. */
 const DEDUP_TTL_SEC = 86_400;
+const THROTTLE_WINDOW_MS = 15 * 60 * 1000;
+const THROTTLE_MAX = 3;
 
 const json = (body: unknown, status: number): Response =>
   new Response(JSON.stringify(body), {
@@ -92,6 +95,7 @@ type GitlabMrPayload = {
     last_commit?: { id?: string };
     oldrev?: string;
     diff_refs?: { base_sha?: string; head_sha?: string };
+    labels?: Array<{ title?: string }>;
   };
 };
 
@@ -158,7 +162,12 @@ export const handleGitlabWebhook = async (
       400,
     );
   }
-
+  const lb = payload.object_attributes?.labels;
+  const ti = Array.isArray(lb) ? lb.map((l) => (l as { title?: unknown })?.title).filter((t): t is string => typeof t === "string") : [];
+  if (ti.includes("skip-ai-review")) {
+    return noContent();
+  }
+  const bypass = ti.includes("request-ai-review");
   // 5. Optional receiver-level dedup on the delivery UUID.
   const deliveryId = request.headers.get(EVENT_UUID_HEADER);
   if (deliveryId !== null && deliveryId.length > 0 && env.IDEMPOTENCY_KV !== undefined) {
@@ -169,7 +178,44 @@ export const handleGitlabWebhook = async (
     }
     await env.IDEMPOTENCY_KV.put(key, "1", { expirationTtl: DEDUP_TTL_SEC });
   }
-
+  const tKey = `throttle:${projectId}:${iid}`;
+  let tState: { starts: number[]; notedAt?: number } | null = null;
+  if (!bypass && env.IDEMPOTENCY_KV !== undefined) {
+    const now = Date.now();
+    const st: { starts: number[]; notedAt?: number } = { starts: [] };
+    const raw = await env.IDEMPOTENCY_KV.get(tKey);
+    if (raw !== null) {
+      try {
+        const p = JSON.parse(raw) as { starts?: unknown; notedAt?: unknown };
+        if (Array.isArray(p.starts)) st.starts = p.starts.filter((x): x is number => typeof x === "number");
+        if (typeof p.notedAt === "number") st.notedAt = p.notedAt;
+      } catch {}
+    }
+    st.starts = st.starts.filter((s) => now - s < THROTTLE_WINDOW_MS);
+    if (st.starts.length >= THROTTLE_MAX) {
+      const retryAt = st.starts[0]! + THROTTLE_WINDOW_MS;
+      const retryAfterSec = Math.max(1, Math.ceil((retryAt - now) / 1000));
+      if (st.notedAt === undefined || now - st.notedAt >= THROTTLE_WINDOW_MS) {
+        const hhmm = new Date(retryAt).toISOString().slice(11, 16);
+        const noteBody = `Review throttled: three reviews in the last 15 minutes. The next review runs after ${hhmm} UTC, or add the \`request-ai-review\` label.\n\n<!-- flare-dispatch: mr-review-throttle -->`;
+        const tok = env.GITLAB_TOKEN;
+        if (tok !== undefined && tok.trim().length > 0) {
+          try {
+            await postMergeRequestNote({ token: tok, projectId, iid, body: noteBody });
+            // Only a delivered note suppresses the next one; a failed or skipped
+            // post leaves notedAt unset so the next trigger retries the note.
+            st.notedAt = now;
+          } catch (e) {
+            console.warn(`[webhook-gitlab] throttle note failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+      }
+      await env.IDEMPOTENCY_KV.put(tKey, JSON.stringify(st), { expirationTtl: 900 });
+      console.log(JSON.stringify({ event: "mr-review.throttled", projectId, iid, retryAfterSec }));
+      return json({ status: "throttled", retryAfterSec }, 202);
+    }
+    tState = st;
+  }
   // 6. The review Workflow must be bound to dispatch.
   if (env.GITLAB_REVIEW_WORKFLOW === undefined) {
     return json(
@@ -201,6 +247,7 @@ export const handleGitlabWebhook = async (
   // The semantic key MUST pass through toInstanceId: CF Workflows accepts only
   // [A-Za-z0-9_-] (≤64 chars) — a raw `:`-joined key fails instance.invalid_id.
   const id = toInstanceId(`mr-review:${input.projectId}:${input.iid}:${input.headSha.slice(0, 12)}`);
+  let duplicated = false;
   try {
     await env.GITLAB_REVIEW_WORKFLOW.create({ id, params: { executionId: id, input } });
   } catch (cause) {
@@ -210,7 +257,11 @@ export const handleGitlabWebhook = async (
       console.error(`[webhook-gitlab] create failed id="${id}": ${message}`);
       return json({ error: "dispatch_failed", detail: message }, 500);
     }
+    duplicated = true;
   }
-
+  if (!duplicated && tState !== null && env.IDEMPOTENCY_KV !== undefined) {
+    tState.starts.push(Date.now());
+    await env.IDEMPOTENCY_KV.put(tKey, JSON.stringify(tState), { expirationTtl: 900 });
+  }
   return json({ accepted: true, executionId: id, action }, 202);
 };

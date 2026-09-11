@@ -69,6 +69,9 @@ importers:
       '@flare-dispatch/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@flare-dispatch/gitlab-app':
+        specifier: workspace:*
+        version: link:../../packages/gitlab-app
       '@flare-dispatch/runs':
         specifier: workspace:*
         version: link:../../runs

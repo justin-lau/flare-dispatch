@@ -2,7 +2,7 @@
   "name": "@flare-dispatch/dispatcher",
   "version": "0.0.0",
   "private": true,
-  "description": "FlareDispatch Dispatcher Worker — HMAC verify, route, instantiate Workflows.",
+  "description": "FlareDispatch Dispatcher Worker \u2014 HMAC verify, route, instantiate Workflows.",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -15,6 +15,7 @@
     "@cloudflare/sandbox": "0.10.1",
     "@effect/platform": "^0.96.1",
     "@flare-dispatch/core": "workspace:*",
+    "@flare-dispatch/gitlab-app": "workspace:*",
     "@flare-dispatch/runs": "workspace:*",
     "@flare-dispatch/runtime-cf": "workspace:*",
     "effect": "^3.21.0"

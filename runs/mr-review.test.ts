@@ -34,7 +34,11 @@ const baseInput: MrReviewInput = {
 };
 
 /** Backend config so the run survives `resolveBackend` (single-agent default). */
-const backendConfig = { "pr-review.workers-ai.model": "@cf/test/model" };
+const backendConfig = {
+  "pr-review.workers-ai.model": "@cf/test/model",
+  // Naive seats are on by default in production; tests opt in per case.
+  "pr-review.naive.enabled": "false",
+};
 
 /** A `report` tool call with one finding, answering the lone generalist reviewer. */
 const reportWithFinding = {
@@ -251,6 +255,51 @@ describe("mr-review", () => {
       expect(Exit.isFailure(exit)).toBe(true);
       const body = scmFake.state.postReviewCalls[0]!.body;
       expect(body).toContain("could not complete");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("naive seats run blind by default and tag findings", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-a\n+b\n" });
+    const naive = (title: string) => ({
+      toolCalls: [{ name: "report", arguments: { findings: [{ path: "src/foo.ts", startLine: 1, endLine: 1, level: "warning", title, message: "msg" }] } }],
+      text: "",
+    });
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding, naive("Naive money"), naive("Naive time"), naive("Naive edges")] });
+    const layer = Layer.mergeAll(
+      scmFake.layer,
+      modelFake.layer,
+      makeConfigFake({ ...backendConfig, "pr-review.naive.enabled": "true", "pr-review.guidelines": "HOUSE-RULE-SENTINEL" }),
+    );
+    return Effect.gen(function* () {
+      expect(Exit.isSuccess(yield* Effect.exit(mrReviewProgram(baseInput)))).toBe(true);
+      expect(modelFake.state.requests).toHaveLength(4);
+      for (const r of modelFake.state.requests.slice(1)) {
+        expect(r.system).toContain("Your only angle is");
+        expect(r.system).not.toContain("HOUSE-RULE-SENTINEL");
+      }
+      expect(scmFake.state.postReviewCalls[0]!.body).toContain("_seat: naive/");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("pr-review.naive.enabled=false adds no calls", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n" });
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding] });
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake({ ...backendConfig, "pr-review.naive.enabled": "false" }));
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      expect(modelFake.state.requests).toHaveLength(1);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("one failing naive call does not fail the run", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n" });
+    const modelFake = makeModelGatewayFake({
+      responses: [reportWithFinding, new ModelGatewayError({ model: "@cf/test/model", reason: "bad-response", message: "boom" }), reportWithFinding, reportWithFinding],
+    });
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake({ ...backendConfig, "pr-review.naive.enabled": "true" }));
+    return Effect.gen(function* () {
+      expect(Exit.isSuccess(yield* Effect.exit(mrReviewProgram(baseInput)))).toBe(true);
+      expect(scmFake.state.postReviewCalls).toHaveLength(1);
     }).pipe(Effect.provide(layer));
   });
 });

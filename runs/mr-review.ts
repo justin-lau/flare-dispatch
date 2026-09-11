@@ -98,6 +98,13 @@ const LITE_AGENTS = ["security", "code-quality", "performance", "documentation"]
 const TRIVIAL_AGENTS = ["code-quality"] as const;
 const GENERAL_AGENT = ["general"] as const;
 
+/** Blind seats: no project context, no guidelines, no MR title — one angle each. */
+const NAIVE_ANGLES = [
+  { id: "money-units", angle: "Money, quantities and units. Look for a value used in the wrong unit or scale, a conversion in the wrong direction, integer versus decimal mistakes, rounding, and a total that does not add up." },
+  { id: "time", angle: "Dates, times and time zones. Look for a wrong boundary (inclusive or exclusive), a missing time zone, a duration or interval mistake, and anything that depends on the clock." },
+  { id: "edges", angle: "Runs twice, empty, zero, one, too many. Look for what happens when an operation repeats, when input is empty or huge, when an id is missing, when a list has one item, and when a string is not ASCII." },
+] as const;
+
 const AGENT_MODES = ["single", "multi"] as const;
 type AgentMode = (typeof AGENT_MODES)[number];
 // The PoC defaults to a SINGLE generalist reviewer (cheapest path to a review);
@@ -376,9 +383,43 @@ const reviewBody = (input: MrReviewInput) =>
       Either.isRight(r) ? r.right : [],
     );
 
+      // 7b. Naive seats — blind, one angle each, on the cheapest model. A seat
+      //     failure is logged and skipped; it never fails the run.
+      const naiveEnabled = (yield* config.get(`${NS}.naive.enabled`)) ?? "true";
+      const naiveModel = (yield* config.get(`${NS}.naive.model`)) ?? "@cf/qwen/qwen3-30b-a3b-fp8";
+      const naiveMaxDiffRaw = Number((yield* config.get(`${NS}.naive.maxDiffChars`)) ?? "60000");
+      const naiveMaxDiffChars = Number.isFinite(naiveMaxDiffRaw) && naiveMaxDiffRaw > 0 ? naiveMaxDiffRaw : 60000;
+      let naiveFindings: ReadonlyArray<Finding> = [];
+      if (naiveEnabled !== "false") {
+        const naiveDiff = capDiff(diff, naiveMaxDiffChars);
+        const naiveResults = yield* Effect.forEach(
+          NAIVE_ANGLES,
+          (seat) =>
+            reviewDomain({
+              agent: `naive/${seat.id}`,
+              diff: naiveDiff,
+              tier: plan.tier,
+              model: naiveModel,
+              backend: resolved.backend,
+              mode: resolved.mode,
+              maxTokens: resolved.maxTokens,
+              systemPrompt: `You are reading a code change with no context about the project. Your only angle is: ${seat.angle}. Report only defects you can point to in the diff, with the file path and the line numbers from the diff. If you find nothing for your angle, return an empty findings list.`,
+            }).pipe(
+              Effect.map((found) => found.map((f) => ({ ...f, message: `${f.message}\n\n_seat: naive/${seat.id}_` }))),
+              Effect.tapError((e) => Effect.logWarning(`mr-review: naive seat ${seat.id} failed — ${describeError(e)}`)),
+              Effect.either,
+              Effect.provideService(ModelGateway, metering),
+            ),
+          { concurrency: 3 },
+        );
+        naiveFindings = naiveResults.flatMap((r) => (Either.isRight(r) ? r.right : []));
+      }
+      const allFindings: ReadonlyArray<Finding> = [...findings, ...naiveFindings];
+      // [mr-review] verifier stage inserts here
+
     // 8. Coordinate — pure deterministic dedup + counts + verdict. Rendering +
     //    posting the note is the caller's concern (mrReviewCompute → mrPostNote).
-    const coordinated = yield* engineCoordinate({ findings });
+    const coordinated = yield* engineCoordinate({ findings: allFindings });
 
     // 9. Aggregate usage + resolve the model's price (operator CONFIG_KV override
     //    over the built-in table) so the caller can render the cost footer.

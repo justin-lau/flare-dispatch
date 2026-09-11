@@ -200,3 +200,61 @@ describe("constantTimeEqual", () => {
     expect(await constantTimeEqual("", "")).toBe(true);
   });
 });
+describe("mr-review labels + throttle", () => {
+  const withHead = (head: string, labels?: Array<{ title: string }>) => ({
+    object_kind: "merge_request",
+    project: { id: 42, web_url: "https://gitlab.com/group/proj" },
+    object_attributes: { iid: 7, action: "open", source_branch: "feature", target_branch: "main", last_commit: { id: head }, diff_refs: { base_sha: "basesha", head_sha: head }, ...(labels !== undefined ? { labels } : {}) },
+  });
+  const tok = (env: Env) => { (env as unknown as Record<string, unknown>).GITLAB_TOKEN = "tok"; };
+  const stub = (notes: string[]) => {
+    const prev = globalThis.fetch;
+    globalThis.fetch = (async (u: unknown, init?: { body?: unknown }) => {
+      if (String(u).includes("/notes")) { notes.push(String(init?.body ?? "")); return new Response("{}", { status: 201 }); }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    return prev;
+  };
+  it("4th throttles one note; 5th no second note", async () => {
+    const { env, reviewWorkflow } = fixture({ withKv: true });
+    tok(env);
+    const notes: string[] = [];
+    const prev = stub(notes);
+    try {
+      const shas = ["aaaa111111111111", "bbbb222222222222", "cccc333333333333", "dddd444444444444"];
+      for (let i = 0; i < 3; i++) await handleRequest(gitlabRequest(withHead(shas[i]!), { token: WEBHOOK_SECRET, deliveryId: `a${i}` }), env);
+      expect(reviewWorkflow.calls).toHaveLength(3);
+      const f = await handleRequest(gitlabRequest(withHead(shas[3]!), { token: WEBHOOK_SECRET, deliveryId: "a3" }), env);
+      expect(f.status).toBe(202);
+      expect(await f.json()).toMatchObject({ status: "throttled" });
+      expect(reviewWorkflow.calls).toHaveLength(3);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]).toContain("<!-- flare-dispatch: mr-review-throttle -->");
+      const g = await handleRequest(gitlabRequest(withHead("eeee555555555555"), { token: WEBHOOK_SECRET, deliveryId: "a4" }), env);
+      expect(await g.json()).toMatchObject({ status: "throttled" });
+      expect(notes).toHaveLength(1);
+    } finally { globalThis.fetch = prev; }
+  });
+  it("request-ai-review bypasses", async () => {
+    const { env, reviewWorkflow } = fixture({ withKv: true });
+    tok(env);
+    const prev = stub([]);
+    try {
+      for (const [i, s] of ["aaaa111111111111", "bbbb222222222222", "cccc333333333333"].entries()) await handleRequest(gitlabRequest(withHead(s), { token: WEBHOOK_SECRET, deliveryId: `b${i}` }), env);
+      const r = await handleRequest(gitlabRequest(withHead("dddd444444444444", [{ title: "request-ai-review" }]), { token: WEBHOOK_SECRET, deliveryId: "b3" }), env);
+      expect(await r.json()).toMatchObject({ accepted: true });
+      expect(reviewWorkflow.calls).toHaveLength(4);
+    } finally { globalThis.fetch = prev; }
+  });
+  it("skip-ai-review 204", async () => {
+    const { env, reviewWorkflow } = fixture({ withKv: true });
+    const r = await handleRequest(gitlabRequest(withHead("ffff666666666666", [{ title: "skip-ai-review" }]), { token: WEBHOOK_SECRET, deliveryId: "s1" }), env);
+    expect(r.status).toBe(204);
+    expect(reviewWorkflow.calls).toHaveLength(0);
+  });
+  it("no KV no throttle", async () => {
+    const { env, reviewWorkflow } = fixture();
+    for (const [i, s] of ["aaaa111111111111", "bbbb222222222222", "cccc333333333333", "dddd444444444444"].entries()) await handleRequest(gitlabRequest(withHead(s), { token: WEBHOOK_SECRET, deliveryId: `n${i}` }), env);
+    expect(reviewWorkflow.calls).toHaveLength(4);
+  });
+});
