@@ -257,4 +257,20 @@ describe("mr-review labels + throttle", () => {
     for (const [i, s] of ["aaaa111111111111", "bbbb222222222222", "cccc333333333333", "dddd444444444444"].entries()) await handleRequest(gitlabRequest(withHead(s), { token: WEBHOOK_SECRET, deliveryId: `n${i}` }), env);
     expect(reviewWorkflow.calls).toHaveLength(4);
   });
+  it("null JSON body → 400 invalid_payload", async () => {
+    const { env, reviewWorkflow } = fixture({ withKv: true });
+    const res = await handleRequest(gitlabRequest(null, { token: WEBHOOK_SECRET }), env);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_payload" });
+    expect(reviewWorkflow.calls).toHaveLength(0);
+  });
+  it("future starts do not throttle", async () => {
+    const { env, reviewWorkflow } = fixture({ withKv: true });
+    const future = Date.now() + 60 * 60 * 1000;
+    await env.IDEMPOTENCY_KV!.put(`throttle:42:7`, JSON.stringify({ starts: [future] }), { expirationTtl: 900 });
+    const res = await handleRequest(gitlabRequest(withHead("ffff666666666666"), { token: WEBHOOK_SECRET, deliveryId: "f1" }), env);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ accepted: true });
+    expect(reviewWorkflow.calls).toHaveLength(1);
+  });
 });

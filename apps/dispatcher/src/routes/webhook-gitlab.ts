@@ -144,6 +144,12 @@ export const handleGitlabWebhook = async (
       400,
     );
   }
+  if (typeof payload !== "object" || payload === null) {
+    return json(
+      { error: "invalid_payload", message: "body must be a JSON object" },
+      400,
+    );
+  }
   const action = payload.object_attributes?.action;
   if (payload.object_kind !== "merge_request" || action === undefined || !REVIEWABLE_ACTIONS.has(action)) {
     return noContent();
@@ -172,29 +178,41 @@ export const handleGitlabWebhook = async (
   const deliveryId = request.headers.get(EVENT_UUID_HEADER);
   if (deliveryId !== null && deliveryId.length > 0 && env.IDEMPOTENCY_KV !== undefined) {
     const key = `gl-delivery:${deliveryId}`;
-    const seen = await env.IDEMPOTENCY_KV.get(key);
-    if (seen !== null) {
-      return json({ deduped: true, deliveryId }, 202);
+    try {
+      const seen = await env.IDEMPOTENCY_KV.get(key);
+      if (seen !== null) {
+        return json({ deduped: true, deliveryId }, 202);
+      }
+    } catch (e) {
+      console.warn(`[webhook-gitlab] dedup get failed: ${e instanceof Error ? e.message : String(e)}`);
     }
-    await env.IDEMPOTENCY_KV.put(key, "1", { expirationTtl: DEDUP_TTL_SEC });
+    try {
+      await env.IDEMPOTENCY_KV.put(key, "1", { expirationTtl: DEDUP_TTL_SEC });
+    } catch (e) {
+      console.warn(`[webhook-gitlab] dedup put failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   const tKey = `throttle:${projectId}:${iid}`;
   let tState: { starts: number[]; notedAt?: number } | null = null;
-  if (!bypass && env.IDEMPOTENCY_KV !== undefined) {
+  if (env.IDEMPOTENCY_KV !== undefined) {
     const now = Date.now();
     const st: { starts: number[]; notedAt?: number } = { starts: [] };
-    const raw = await env.IDEMPOTENCY_KV.get(tKey);
-    if (raw !== null) {
-      try {
-        const p = JSON.parse(raw) as { starts?: unknown; notedAt?: unknown };
-        if (Array.isArray(p.starts)) st.starts = p.starts.filter((x): x is number => typeof x === "number");
-        if (typeof p.notedAt === "number") st.notedAt = p.notedAt;
-      } catch {}
+    try {
+      const raw = await env.IDEMPOTENCY_KV.get(tKey);
+      if (raw !== null) {
+        try {
+          const p = JSON.parse(raw) as { starts?: unknown; notedAt?: unknown };
+          if (Array.isArray(p.starts)) st.starts = p.starts.filter((x): x is number => typeof x === "number");
+          if (typeof p.notedAt === "number") st.notedAt = p.notedAt;
+        } catch {}
+      }
+    } catch (e) {
+      console.warn(`[webhook-gitlab] throttle get failed: ${e instanceof Error ? e.message : String(e)}`);
     }
-    st.starts = st.starts.filter((s) => now - s < THROTTLE_WINDOW_MS);
-    if (st.starts.length >= THROTTLE_MAX) {
+    st.starts = st.starts.filter((s) => s <= now && now - s < THROTTLE_WINDOW_MS).sort((a, b) => a - b);
+    if (!bypass && st.starts.length >= THROTTLE_MAX) {
       const retryAt = st.starts[0]! + THROTTLE_WINDOW_MS;
-      const retryAfterSec = Math.max(1, Math.ceil((retryAt - now) / 1000));
+      const retryAfterSec = Math.min(900, Math.max(1, Math.ceil((retryAt - now) / 1000)));
       if (st.notedAt === undefined || now - st.notedAt >= THROTTLE_WINDOW_MS) {
         const hhmm = new Date(retryAt).toISOString().slice(11, 16);
         const noteBody = `Review throttled: three reviews in the last 15 minutes. The next review runs after ${hhmm} UTC, or add the \`request-ai-review\` label.\n\n<!-- flare-dispatch: mr-review-throttle -->`;
@@ -210,7 +228,11 @@ export const handleGitlabWebhook = async (
           }
         }
       }
-      await env.IDEMPOTENCY_KV.put(tKey, JSON.stringify(st), { expirationTtl: 900 });
+      try {
+        await env.IDEMPOTENCY_KV.put(tKey, JSON.stringify(st), { expirationTtl: 900 });
+      } catch (e) {
+        console.warn(`[webhook-gitlab] throttle put failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
       console.log(JSON.stringify({ event: "mr-review.throttled", projectId, iid, retryAfterSec }));
       return json({ status: "throttled", retryAfterSec }, 202);
     }
@@ -242,6 +264,12 @@ export const handleGitlabWebhook = async (
       ? { targetBranch: payload.object_attributes.target_branch }
       : {}),
   };
+  if (input.headSha.length === 0 || input.baseSha.length === 0) {
+    return json(
+      { error: "invalid_payload", message: "headSha and baseSha must be non-empty" },
+      400,
+    );
+  }
 
   // 8. Dispatch — a stable id collapses redeliveries at the platform layer.
   // The semantic key MUST pass through toInstanceId: CF Workflows accepts only
@@ -261,7 +289,11 @@ export const handleGitlabWebhook = async (
   }
   if (!duplicated && tState !== null && env.IDEMPOTENCY_KV !== undefined) {
     tState.starts.push(Date.now());
-    await env.IDEMPOTENCY_KV.put(tKey, JSON.stringify(tState), { expirationTtl: 900 });
+    try {
+      await env.IDEMPOTENCY_KV.put(tKey, JSON.stringify(tState), { expirationTtl: 900 });
+    } catch (e) {
+      console.warn(`[webhook-gitlab] throttle record failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   return json({ accepted: true, executionId: id, action }, 202);
 };
