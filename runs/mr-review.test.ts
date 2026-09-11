@@ -19,6 +19,7 @@ import {
   makeScmFake,
 } from "@flare-dispatch/core/testing";
 import { mrInputsFromPayload, mrReview, mrReviewProgram, type MrReviewInput } from "./mr-review";
+import { mergeNearDuplicates } from "./mr-review";
 
 const hakiri = setupServer();
 beforeAll(() => hakiri.listen({ onUnhandledRequest: "bypass" }));
@@ -38,6 +39,7 @@ const backendConfig = {
   "pr-review.workers-ai.model": "@cf/test/model",
   // Naive seats are on by default in production; tests opt in per case.
   "pr-review.naive.enabled": "false",
+  "pr-review.verify.enabled": "false",
 };
 
 /** A `report` tool call with one finding, answering the lone generalist reviewer. */
@@ -302,6 +304,44 @@ describe("mr-review", () => {
       expect(scmFake.state.postReviewCalls).toHaveLength(1);
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect("verify refuted by both lenses drops the finding", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n" });
+    const refuted = { toolCalls: [{ name: "report", arguments: { verdict: "refuted", reason: "no" } }], text: "" };
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding, refuted, refuted] });
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake({ ...backendConfig, "pr-review.verify.enabled": "true" }));
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      expect(modelFake.state.requests).toHaveLength(3);
+      expect(scmFake.state.postReviewCalls[0]!.body).not.toContain("Missing null check");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("verify confirmed by both keeps CONFIRMED (2/2)", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n" });
+    const confirmed = { toolCalls: [{ name: "report", arguments: { verdict: "confirmed", reason: "yes" } }], text: "" };
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding, confirmed, confirmed] });
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake({ ...backendConfig, "pr-review.verify.enabled": "true" }));
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      const body = scmFake.state.postReviewCalls[0]!.body;
+      expect(body).toContain("Missing null check");
+      expect(body).toContain("_verification: CONFIRMED (2/2)_");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("pr-review.verify.enabled=false adds no calls", () => {
+    const scmFake = makeScmFake({ diff: "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n" });
+    const modelFake = makeModelGatewayFake({ responses: [reportWithFinding] });
+    const layer = Layer.mergeAll(scmFake.layer, modelFake.layer, makeConfigFake({ ...backendConfig, "pr-review.verify.enabled": "false" }));
+    return Effect.gen(function* () {
+      yield* mrReviewProgram(baseInput);
+      expect(modelFake.state.requests).toHaveLength(1);
+      const body = scmFake.state.postReviewCalls[0]!.body;
+      expect(body).toContain("Missing null check");
+      expect(body).not.toContain("_verification:");
+    }).pipe(Effect.provide(layer));
+  });
 });
 
 describe("mr-review trigger", () => {
@@ -339,5 +379,14 @@ describe("mr-review trigger", () => {
     });
     expect(fallback.headSha).toBe("csha");
     expect(fallback.baseSha).toBe("osha");
+  });
+});
+
+describe("mergeNearDuplicates", () => {
+  it("keeps one finding per path, level and overlapping range", () => {
+    const f = (startLine: number, endLine: number, level: "failure" | "warning", title: string) =>
+      ({ path: "a.ts", startLine, endLine, level, title, message: "m" }) as const;
+    const merged = mergeNearDuplicates([f(14, 17, "failure", "SQLi"), f(14, 16, "failure", "SQL injection"), f(14, 16, "warning", "style"), f(30, 31, "failure", "other")]);
+    expect(merged.map((x) => x.title)).toEqual(["SQLi", "style", "other"]);
   });
 });

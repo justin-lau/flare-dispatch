@@ -45,6 +45,7 @@ import {
 import {
   BackendUnconfigured,
   capDiff,
+  completeStructured,
   coordinate as engineCoordinate,
   DEFAULT_NAMESPACE,
   DEFAULT_REVIEW_SYSTEM_PROMPT,
@@ -104,6 +105,23 @@ const NAIVE_ANGLES = [
   { id: "time", angle: "Dates, times and time zones. Look for a wrong boundary (inclusive or exclusive), a missing time zone, a duration or interval mistake, and anything that depends on the clock." },
   { id: "edges", angle: "Runs twice, empty, zero, one, too many. Look for what happens when an operation repeats, when input is empty or huge, when an id is missing, when a list has one item, and when a string is not ASCII." },
 ] as const;
+
+const VERIFY_LENSES = [
+  { id: "cited-line", text: "Does the cited code actually say what the finding claims? Read the diff at the cited path and lines. Default to refuting: the finding survives only if the cited lines contain the claimed defect." },
+  { id: "handled-elsewhere", text: "Is the claimed defect already handled in the diff, before or after the cited lines, or made impossible by the surrounding code in the diff? Default to refuting: the finding survives only if nothing in the diff handles it." },
+] as const;
+
+/** Same path, same level, overlapping line ranges → one finding (the first wins). */
+export const mergeNearDuplicates = (fs: ReadonlyArray<Finding>): ReadonlyArray<Finding> => {
+  const kept: Finding[] = [];
+  for (const f of fs) {
+    const dup = kept.find(
+      (k) => k.path === f.path && k.level === f.level && k.startLine <= f.endLine && f.startLine <= k.endLine,
+    );
+    if (dup === undefined) kept.push(f);
+  }
+  return kept;
+};
 
 const AGENT_MODES = ["single", "multi"] as const;
 type AgentMode = (typeof AGENT_MODES)[number];
@@ -414,12 +432,46 @@ const reviewBody = (input: MrReviewInput) =>
         );
         naiveFindings = naiveResults.flatMap((r) => (Either.isRight(r) ? r.right : []));
       }
-      const allFindings: ReadonlyArray<Finding> = [...findings, ...naiveFindings];
-      // [mr-review] verifier stage inserts here
+      // 7c. Near-duplicate merge — personas phrase the same defect differently.
+      //     Same path, same level, overlapping lines: keep the first.
+      const allFindings: ReadonlyArray<Finding> = mergeNearDuplicates([...findings, ...naiveFindings]);
+      const verifyEnabled = (yield* config.get(`${NS}.verify.enabled`)) ?? "true";
+      const verifyModel = (yield* config.get(`${NS}.verify.model`)) ?? resolved.model;
+      const verifyMaxRaw = Number((yield* config.get(`${NS}.verify.maxFindings`)) ?? "12");
+      const verifyMax = Number.isFinite(verifyMaxRaw) && verifyMaxRaw > 0 ? Math.floor(verifyMaxRaw) : 12;
+      let verifiedFindings: ReadonlyArray<Finding> = allFindings;
+      if (verifyEnabled !== "false" && allFindings.length > 0) {
+        const rank = (level: Finding["level"]): number => level === "failure" ? 0 : level === "warning" ? 1 : 2;
+        const ordered = [...allFindings].sort((a, b) => rank(a.level) - rank(b.level));
+        const capped = ordered.slice(0, verifyMax);
+        const rest = ordered.slice(verifyMax);
+        const VerifyResult = Schema.Struct({ verdict: Schema.Literal("confirmed", "plausible", "refuted"), reason: Schema.String });
+        const verifyOne = (finding: Finding, lens: (typeof VERIFY_LENSES)[number]) =>
+          completeStructured({ backend: resolved.backend, model: verifyModel, mode: resolved.mode, system: `You are verifying a code review finding. ${lens.text}`, userBody: `Unified diff:\n${diff}\n\nFinding:\npath: ${finding.path}\nlines: ${finding.startLine}-${finding.endLine}\nlevel: ${finding.level}\ntitle: ${finding.title}\nmessage: ${finding.message}`, schema: VerifyResult, surface: "verify" }).pipe(Effect.map((o) => o.verdict), Effect.catchAll((e) => Effect.logWarning(`mr-review: verify ${lens.id} failed — ${describeError(e)}`).pipe(Effect.as("plausible" as const))), Effect.provideService(ModelGateway, metering));
+        // One flat fan-out: true concurrency 6 across (finding, lens) pairs.
+        const pairs = capped.flatMap((finding, idx) => VERIFY_LENSES.map((lens) => ({ idx, finding, lens })));
+        const verdicts = yield* Effect.forEach(
+          pairs,
+          (pr) => verifyOne(pr.finding, pr.lens).pipe(Effect.map((v) => ({ idx: pr.idx, v }))),
+          { concurrency: 6 },
+        );
+        const checked = capped.map((finding, idx) => {
+          const vs = verdicts.filter((x) => x.idx === idx).map((x) => x.v);
+          const confirms = vs.filter((v) => v === "confirmed").length;
+          const refutes = vs.filter((v) => v === "refuted").length;
+          if (refutes === 2) return undefined;
+          const suffix = confirms === 2 ? "\n\n_verification: CONFIRMED (2/2)_" : confirms === 1 ? "\n\n_verification: PLAUSIBLE (1/2)_" : "\n\n_verification: PLAUSIBLE (0/2)_";
+          return { ...finding, message: `${finding.message}${suffix}` };
+        });
+        const keptCapped = checked.flatMap((f) => f === undefined ? [] : [f]);
+        const skipped = rest.map((f) => ({ ...f, message: `${f.message}\n\n_verification: skipped_` }));
+        verifiedFindings = [...keptCapped, ...skipped];
+        yield* Effect.logInfo(JSON.stringify({ event: "mr-review.verify", kept: verifiedFindings.length, dropped: capped.length - keptCapped.length }));
+      }
 
     // 8. Coordinate — pure deterministic dedup + counts + verdict. Rendering +
     //    posting the note is the caller's concern (mrReviewCompute → mrPostNote).
-    const coordinated = yield* engineCoordinate({ findings: allFindings });
+    const coordinated = yield* engineCoordinate({ findings: verifiedFindings });
 
     // 9. Aggregate usage + resolve the model's price (operator CONFIG_KV override
     //    over the built-in table) so the caller can render the cost footer.
