@@ -274,3 +274,68 @@ describe("mr-review labels + throttle", () => {
     expect(reviewWorkflow.calls).toHaveLength(1);
   });
 });
+
+describe("mr-review pause", () => {
+  const pauseEnv = async (pauseValue: string | null, withConfigKv = true) => {
+    const reviewWorkflow = makeFakeWorkflow();
+    const idempotencyKv = makeFakeKv();
+    const configKv = makeFakeKv();
+    if (pauseValue !== null) {
+      await configKv.binding.put("pr-review.paused", pauseValue);
+    }
+    const env: Env = makeFakeEnv({
+      hmacSecret: "unused",
+      workflow: makeFakeWorkflow(),
+      storage: makeFakeR2(),
+      idempotencyKv: idempotencyKv.binding,
+      ...(withConfigKv ? { configKv: configKv.binding } : {}),
+      gitlabWebhookSecret: WEBHOOK_SECRET,
+      gitlabReviewWorkflow: reviewWorkflow.binding,
+    });
+    return { env, reviewWorkflow };
+  };
+  it("key present → 200 paused, no dispatch, no throttle or dedup writes", async () => {
+    const { env, reviewWorkflow } = await pauseEnv("2026-09-13 cost spike, Justin");
+    const uuid = "pause-delivery-1";
+    const res = await handleRequest(gitlabRequest(mrPayload("open"), { token: WEBHOOK_SECRET, deliveryId: uuid }), env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "paused", reason: "2026-09-13 cost spike, Justin" });
+    expect(reviewWorkflow.calls).toHaveLength(0);
+    expect(await env.IDEMPOTENCY_KV!.get("throttle:42:7")).toBeNull();
+    expect(await env.IDEMPOTENCY_KV!.get(`gl-delivery:${uuid}`)).toBeNull();
+  });
+  it("key present + request-ai-review label → still 200 paused, no dispatch", async () => {
+    const { env, reviewWorkflow } = await pauseEnv("2026-09-13 cost spike, Justin");
+    const labeled = {
+      object_kind: "merge_request",
+      project: { id: 42, web_url: "https://gitlab.com/group/proj" },
+      object_attributes: {
+        iid: 7,
+        action: "open",
+        source_branch: "feature",
+        target_branch: "main",
+        last_commit: { id: "commitsha1234567890" },
+        diff_refs: { base_sha: "basesha", head_sha: "headsha1234567890" },
+        labels: [{ title: "request-ai-review" }],
+      },
+    };
+    const res = await handleRequest(gitlabRequest(labeled, { token: WEBHOOK_SECRET, deliveryId: "pause-delivery-2" }), env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "paused", reason: "2026-09-13 cost spike, Justin" });
+    expect(reviewWorkflow.calls).toHaveLength(0);
+  });
+  it("key absent (CONFIG_KV bound but empty) → 202 accepted, one create", async () => {
+    const { env, reviewWorkflow } = await pauseEnv(null);
+    const res = await handleRequest(gitlabRequest(mrPayload("open"), { token: WEBHOOK_SECRET, deliveryId: "pause-delivery-3" }), env);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ accepted: true });
+    expect(reviewWorkflow.calls).toHaveLength(1);
+  });
+  it("CONFIG_KV undefined → 202 accepted, one create", async () => {
+    const { env, reviewWorkflow } = await pauseEnv(null, false);
+    const res = await handleRequest(gitlabRequest(mrPayload("open"), { token: WEBHOOK_SECRET, deliveryId: "pause-delivery-4" }), env);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ accepted: true });
+    expect(reviewWorkflow.calls).toHaveLength(1);
+  });
+});

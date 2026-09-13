@@ -37,6 +37,9 @@ const REVIEWABLE_ACTIONS = new Set(["open", "reopen", "update"]);
 const DEDUP_TTL_SEC = 86_400;
 const THROTTLE_WINDOW_MS = 15 * 60 * 1000;
 const THROTTLE_MAX = 3;
+// Operator pause: presence = paused, value = reason.
+// Delete the key to resume.
+const PAUSE_KEY = "pr-review.paused";
 
 const json = (body: unknown, status: number): Response =>
   new Response(JSON.stringify(body), {
@@ -174,6 +177,19 @@ export const handleGitlabWebhook = async (
     return noContent();
   }
   const bypass = ti.includes("request-ai-review");
+  // 4c. Operator pause: CONFIG_KV pr-review.paused presence pauses dispatch.
+  // Value is the free-text reason; delete the key to resume. No Workflow,
+  // throttle or dedup writes occur while paused; request-ai-review does not bypass.
+  let paused: string | null = null;
+  try {
+    paused = (await env.CONFIG_KV?.get(PAUSE_KEY)) ?? null;
+  } catch (e) {
+    console.warn(`[webhook-gitlab] pause get failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (paused !== null) {
+    const reason = paused.trim().slice(0, 200);
+    return json({ status: "paused", reason }, 200);
+  }
   // 5. Optional receiver-level dedup on the delivery UUID.
   const deliveryId = request.headers.get(EVENT_UUID_HEADER);
   if (deliveryId !== null && deliveryId.length > 0 && env.IDEMPOTENCY_KV !== undefined) {
