@@ -22,13 +22,13 @@
     {
       "binding": "RUNS_METADATA",
       "database_name": "flare-dispatch-review",
-      "database_id": "b1008f51-093a-4caa-8a59-79edb039c0c1",
+      "database_id": "c414dadd-6b48-41c5-9c85-a93e5fc3531d",
       "migrations_dir": "../../infra/migrations"
     }
   ],
   "kv_namespaces": [
-    { "binding": "CONFIG_KV", "id": "14e99372aef84fa0b218a95188c9f84d" },
-    { "binding": "IDEMPOTENCY_KV", "id": "26e39fe49667408d950fa5ba02466c4e" }
+    { "binding": "CONFIG_KV", "id": "dbbbdf12e619481c9fd68b00a7413606" },
+    { "binding": "IDEMPOTENCY_KV", "id": "fae353ffbafd4919b1af3e537d137f6a" }
   ],
   "vars": { "VIEWER_ACCESS_MODE": "token-only" }
 }
